@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "nano-vllm"
 version = "0.2.0"
-authors = [{ name = "Xingkai Yu" }]
+authors = [{ name = "Chia-Han Lu" }]
 license = "MIT"
 license-files = ["LICENSE"]
 readme = "README.md"
@@ -16,6 +16,7 @@ dependencies = [
     "triton>=3.0.0",
     "transformers>=4.51.0",
     "xxhash",
+    "flashinfer-python",
 ]
 
 [project.urls]

@@ -1,8 +1,8 @@
 import torch
-import torch.nn.functional as F
 from torch import nn
 import triton
 import triton.language as tl
+import flashinfer
 
 from nanovllm.utils.context import get_context
 
@@ -40,26 +40,56 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
-def _gather_from_blocks(cache: torch.Tensor, block_table: torch.Tensor, block_size: int, length: int) -> torch.Tensor:
-    """cache: (num_blocks, block_size, num_kv_heads, head_dim); returns (length, num_kv_heads, head_dim)."""
-    n_blocks = (length + block_size - 1) // block_size
-    blocks = cache[block_table[:n_blocks]]    # (n_blocks, block_size, num_kv_heads, head_dim)
-    return blocks.reshape(-1, *cache.shape[-2:])[:length]
+_WORKSPACE_BYTES = 128 * 1024 * 1024
+_prefill_wrapper = None
+_decode_wrapper = None
+_ragged_prefill_wrapper = None
 
 
-def _repeat_kv_heads(x: torch.Tensor, n_rep: int) -> torch.Tensor:
-    """x: (kv_heads, seqlen, head_dim) -> (kv_heads * n_rep, seqlen, head_dim), GQA broadcast."""
-    if n_rep == 1:
-        return x
-    return x.repeat_interleave(n_rep, dim=0)
+def _get_prefill_wrapper(device):
+    global _prefill_wrapper
+    if _prefill_wrapper is None:
+        buf = torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+        _prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(buf, kv_layout="NHD")
+    return _prefill_wrapper
+
+
+def _get_decode_wrapper(device):
+    global _decode_wrapper
+    if _decode_wrapper is None:
+        buf = torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+        _decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(buf, kv_layout="NHD")
+    return _decode_wrapper
+
+
+def _get_ragged_prefill_wrapper(device):
+    global _ragged_prefill_wrapper
+    if _ragged_prefill_wrapper is None:
+        buf = torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+        _ragged_prefill_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(buf, kv_layout="NHD")
+    return _ragged_prefill_wrapper
+
+
+def _paged_kv_meta(block_tables: torch.Tensor, kv_lens: torch.Tensor, block_size: int):
+    """block_tables: (num_seqs, max_blocks) padded with -1, real block ids first (see
+    ModelRunner.prepare_block_tables). Returns FlashInfer's paged-kv CSR triple."""
+    num_pages = (kv_lens + block_size - 1) // block_size
+    indptr = torch.zeros(kv_lens.numel() + 1, dtype=torch.int32, device=kv_lens.device)
+    indptr[1:] = torch.cumsum(num_pages, dim=0)
+    last_page_len = (kv_lens - (num_pages - 1) * block_size).to(torch.int32)
+    indices = block_tables[block_tables >= 0].to(torch.int32)
+    return indptr, indices, last_page_len
 
 
 class Attention(nn.Module):
-    """ponytail: attention math is SDPA (torch.nn.functional.scaled_dot_product_attention),
-    not flash-attn — flash-attn has no aarch64/Jetson wheel and from-source build was judged
-    too slow/risky for M0 (see spec/2026-07-06-figure1-implementation-plan-design.md M0 notes).
-    Per-sequence Python loop over the packed batch: not CUDA-graph-safe (uses .item()), so this
-    only works with enforce_eager=True. No perf requirement for Figure 1 M0/M1 baseline correctness."""
+    """Attention math is FlashInfer's paged-KV-cache wrappers, reading/writing
+    nano-vLLM's existing (num_blocks, block_size, num_kv_heads, head_dim) cache
+    directly (it matches FlashInfer's NHD paged layout, no conversion needed).
+    Only the warmup path (before allocate_kv_cache, no cache tensors yet) has no
+    page table to read from; it uses the ragged (non-paged) prefill wrapper on
+    q/k/v directly instead. GQA broadcast and causal masking (including the
+    seqlen_q != seqlen_k prefix-cache case) are handled internally by FlashInfer.
+    enforce_eager=True only: plan()/run() are host-synchronous, not CUDA-graph-safe."""
 
     def __init__(
         self,
@@ -73,51 +103,42 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
-        self.n_rep = num_heads // num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
 
     def _prefill(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, context) -> torch.Tensor:
-        block_size = self.k_cache.shape[1] if self.k_cache.numel() else 0
-        n_seqs = context.cu_seqlens_q.numel() - 1
-        outputs = []
-        for i in range(n_seqs):
-            qs, qe = context.cu_seqlens_q[i].item(), context.cu_seqlens_q[i + 1].item()
-            ks, ke = context.cu_seqlens_k[i].item(), context.cu_seqlens_k[i + 1].item()
-            seqlen_q, seqlen_k = qe - qs, ke - ks
-            qi = q[qs:qe].transpose(0, 1)    # (num_heads, seqlen_q, head_dim)
-            if context.block_tables is not None:    # prefix cache: read k/v back from the paged cache
-                ki = _gather_from_blocks(self.k_cache, context.block_tables[i], block_size, seqlen_k).transpose(0, 1)
-                vi = _gather_from_blocks(self.v_cache, context.block_tables[i], block_size, seqlen_k).transpose(0, 1)
-            else:
-                ki = k[ks:ke].transpose(0, 1)    # (num_kv_heads, seqlen_k, head_dim)
-                vi = v[ks:ke].transpose(0, 1)
-            ki, vi = _repeat_kv_heads(ki, self.n_rep), _repeat_kv_heads(vi, self.n_rep)
-            if seqlen_q == seqlen_k:
-                oi = F.scaled_dot_product_attention(qi.unsqueeze(0), ki.unsqueeze(0), vi.unsqueeze(0),
-                                                     scale=self.scale, is_causal=True)
-            else:
-                offset = seqlen_k - seqlen_q
-                q_idx = torch.arange(seqlen_q, device=q.device).unsqueeze(1) + offset
-                k_idx = torch.arange(seqlen_k, device=q.device).unsqueeze(0)
-                attn_mask = k_idx <= q_idx
-                oi = F.scaled_dot_product_attention(qi.unsqueeze(0), ki.unsqueeze(0), vi.unsqueeze(0),
-                                                     attn_mask=attn_mask, scale=self.scale)
-            outputs.append(oi.squeeze(0).transpose(0, 1))    # (seqlen_q, num_heads, head_dim)
-        return torch.cat(outputs, dim=0)
+        if context.block_tables is None:    # warmup: no cache allocated yet
+            wrapper = _get_ragged_prefill_wrapper(q.device)
+            wrapper.plan(
+                context.cu_seqlens_q, context.cu_seqlens_k,
+                num_qo_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
+                head_dim_qk=self.head_dim, causal=True, sm_scale=self.scale,
+                q_data_type=q.dtype, kv_data_type=k.dtype,
+            )
+            return wrapper.run(q, k, v)
+
+        block_size = self.k_cache.shape[1]
+        kv_lens = context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]
+        indptr, indices, last_page_len = _paged_kv_meta(context.block_tables, kv_lens, block_size)
+        wrapper = _get_prefill_wrapper(q.device)
+        wrapper.plan(
+            context.cu_seqlens_q, indptr, indices, last_page_len,
+            num_qo_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
+            head_dim_qk=self.head_dim, page_size=block_size, causal=True, sm_scale=self.scale,
+            q_data_type=q.dtype, kv_data_type=self.k_cache.dtype,
+        )
+        return wrapper.run(q, (self.k_cache, self.v_cache))
 
     def _decode(self, q: torch.Tensor, context) -> torch.Tensor:
         block_size = self.k_cache.shape[1]
-        bs = q.shape[0]
-        outputs = []
-        for i in range(bs):
-            clen = context.context_lens[i].item()
-            ki = _gather_from_blocks(self.k_cache, context.block_tables[i], block_size, clen).transpose(0, 1)
-            vi = _gather_from_blocks(self.v_cache, context.block_tables[i], block_size, clen).transpose(0, 1)
-            ki, vi = _repeat_kv_heads(ki, self.n_rep), _repeat_kv_heads(vi, self.n_rep)
-            qi = q[i].unsqueeze(1)    # (num_heads, 1, head_dim)
-            oi = F.scaled_dot_product_attention(qi.unsqueeze(0), ki.unsqueeze(0), vi.unsqueeze(0), scale=self.scale)
-            outputs.append(oi.squeeze(0).squeeze(1))    # (num_heads, head_dim)
-        return torch.stack(outputs, dim=0)
+        indptr, indices, last_page_len = _paged_kv_meta(context.block_tables, context.context_lens, block_size)
+        wrapper = _get_decode_wrapper(q.device)
+        wrapper.plan(
+            indptr, indices, last_page_len,
+            num_qo_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_dim, page_size=block_size, sm_scale=self.scale,
+            q_data_type=q.dtype, kv_data_type=self.k_cache.dtype,
+        )
+        return wrapper.run(q, (self.k_cache, self.v_cache))
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
