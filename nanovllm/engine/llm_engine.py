@@ -48,6 +48,15 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        if not seqs:
+            # A Scheduler subclass (figure1's OffloadScheduler, M3) can
+            # legitimately have nothing to schedule this round -- e.g. while
+            # a swap-in is in flight and it's the only outstanding job.
+            # model_runner.run()'s prepare_decode/prepare_prefill both index
+            # into `seqs` unconditionally (e.g. max(len(seq.block_table) for
+            # seq in seqs)), which raises on an empty batch, so skip the
+            # model call entirely rather than run it on a degenerate batch.
+            return [], 0
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
