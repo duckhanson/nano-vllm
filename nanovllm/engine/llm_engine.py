@@ -49,7 +49,7 @@ class LLMEngine:
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
         if not seqs:
-            # A Scheduler subclass (figure1's OffloadScheduler, M3) can
+            # A Scheduler subclass (pass_offload's OffloadScheduler, M3) can
             # legitimately have nothing to schedule this round -- e.g. while
             # a swap-in is in flight and it's the only outstanding job.
             # model_runner.run()'s prepare_decode/prepare_prefill both index
