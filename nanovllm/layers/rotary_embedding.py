@@ -19,7 +19,7 @@ def _llama3_inv_freq(inv_freq: torch.Tensor, rope_scaling: dict) -> torch.Tensor
 
     inv_freq_llama = torch.where(wavelen > low_freq_wavelen, inv_freq / factor, inv_freq)
     smooth_factor = (old_context_len / wavelen - low_freq_factor) / (high_freq_factor - low_freq_factor)
-    smoothed_inv_freq = smooth_factor * inv_freq_llama / factor + (1 - smooth_factor) * inv_freq_llama
+    smoothed_inv_freq = (1 - smooth_factor) * inv_freq_llama / factor + smooth_factor * inv_freq_llama
     is_medium_freq = ~(wavelen < high_freq_wavelen) & ~(wavelen > low_freq_wavelen)
     return torch.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
 
