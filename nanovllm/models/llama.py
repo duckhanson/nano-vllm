@@ -50,6 +50,8 @@ class LlamaAttention(nn.Module):
             hidden_size,
             bias=False,
         )
+        if isinstance(rope_scaling, dict):
+            rope_theta = rope_scaling.get("rope_theta", rope_theta)
         self.rotary_emb = get_rope(
             self.head_dim,
             rotary_dim=self.head_dim,
