@@ -1,4 +1,5 @@
 import pickle
+import flashinfer
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -8,6 +9,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.llama import LlamaForCausalLM
+from nanovllm.layers.attention import WORKSPACE_BYTES, plan_decode
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -69,7 +71,7 @@ class ModelRunner:
             if self.rank == 0:
                 self.shm.unlink()
         if not self.enforce_eager:
-            del self.graphs, self.graph_pool
+            del self.graphs, self.graph_pool, self.graph_decode_wrappers
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -130,11 +132,33 @@ class ModelRunner:
         kv_cache_shape = (2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         self.kv_cache, self.kv_cache_cpu_view = allocate_mapped_kv_cache(kv_cache_shape, hf_config.dtype)
         layer_id = 0
+        attn_module = None
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
+                attn_module = module
                 layer_id += 1
+
+        # Every layer's Attention is constructed with the same num_heads/
+        # num_kv_heads/head_dim/scale (see e.g. LlamaAttention.__init__) --
+        # decode planning only needs one copy of these, read from whichever
+        # layer's module the loop above last touched (2026-07-25: this is
+        # what makes plan_decode() callable once per decode step instead of
+        # once per layer -- see model_runner's run_model()/capture_cudagraph()
+        # and attention.py's own docstring).
+        self._decode_plan_kwargs = dict(
+            num_qo_heads=attn_module.num_heads, num_kv_heads=attn_module.num_kv_heads,
+            head_dim=attn_module.head_dim, sm_scale=attn_module.scale,
+            q_dtype=hf_config.dtype, kv_dtype=hf_config.dtype,
+        )
+        # Eager-mode decode wrapper: one shared singleton, matching the
+        # pre-2026-07-25 module-level global attention.py used to own --
+        # only its construction moved here, since plan_decode() call sites
+        # now all live in ModelRunner, not Attention._decode().
+        self._decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device="cuda"), kv_layout="NHD",
+        )
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -211,11 +235,24 @@ class ModelRunner:
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+            if not is_prefill:
+                # One plan() per decode step (not per layer -- see
+                # attention.py's plan_decode() docstring); every layer's
+                # Attention._decode() reads this same freshly-planned
+                # wrapper off context.decode_wrapper.
+                context = get_context()
+                plan_decode(
+                    self._decode_wrapper, context.block_tables, context.context_lens,
+                    self.block_size, **self._decode_plan_kwargs,
+                )
+                context.decode_wrapper = self._decode_wrapper
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            bucket_bs = next(x for x in self.graph_bs if x >= bs)
+            graph = self.graphs[bucket_bs]
+            decode_wrapper = self.graph_decode_wrappers[bucket_bs]
             graph_vars = self.graph_vars
             graph_vars["input_ids"][:bs] = input_ids
             graph_vars["positions"][:bs] = positions
@@ -223,7 +260,23 @@ class ModelRunner:
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
             graph_vars["context_lens"].zero_()
             graph_vars["context_lens"][:bs] = context.context_lens
+            # Padding rows (bs..bucket_bs-1) must read as zero pages, not
+            # whatever a previous, possibly-larger call left behind -- -1 is
+            # this codebase's own "no block here" convention (see
+            # prepare_block_tables()); plan_decode() below reads the FULL
+            # bucket_bs-wide tensor (not just [:bs]), since the wrapper's
+            # FlashInfer-fixed batch size is bucket_bs, so stale positive
+            # block ids in the unused rows would otherwise get silently
+            # counted as real pages by _paged_kv_meta()'s `>= 0` filter.
+            graph_vars["block_tables"].fill_(-1)
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            # Sliced to :bucket_bs, not the full max_bs-wide graph_vars --
+            # the wrapper's own FlashInfer-fixed batch size is bucket_bs.
+            plan_decode(
+                decode_wrapper, graph_vars["block_tables"][:bucket_bs], graph_vars["context_lens"][:bucket_bs],
+                self.block_size, **self._decode_plan_kwargs,
+            )
+            context.decode_wrapper = decode_wrapper
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -245,15 +298,50 @@ class ModelRunner:
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        # -1 ("no block here", this codebase's own convention -- see
+        # prepare_block_tables()), not 0 -- 0 is a valid block id, and
+        # _paged_kv_meta()'s `>= 0` filter would otherwise silently count
+        # every unused row's leftover entries as real pages once
+        # plan_decode() starts reading this tensor for real (2026-07-25;
+        # previously never mattered, since nothing ever called
+        # _paged_kv_meta()/plan() against this dummy warmup/capture data
+        # before FlashInfer's plan()/run() split existed here -- see
+        # run_model()'s own graph branch for the equivalent replay-time fix).
+        block_tables = torch.full((max_bs, max_num_blocks), -1, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
+        self.graph_decode_wrappers = {}
+
+        # One shared 128MB scratch buffer across every bucket's wrapper --
+        # matches the eager singleton's own sizing (allocate_kv_cache()) --
+        # only the tiny indptr/indices/last_page_len buffers need to be
+        # per-bucket (FlashInfer's CUDAGraphBatchDecodeWithPagedKVCacheWrapper
+        # fixes batch_size to whatever paged_kv_last_page_len_buffer's own
+        # length is, for that wrapper instance's whole lifetime).
+        decode_workspace_buffer = torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device="cuda")
 
         for bs in reversed(self.graph_bs):
+            indptr_buffer = torch.zeros(bs + 1, dtype=torch.int32, device="cuda")
+            indices_buffer = torch.zeros(bs * max_num_blocks, dtype=torch.int32, device="cuda")
+            last_page_len_buffer = torch.zeros(bs, dtype=torch.int32, device="cuda")
+            decode_wrapper = flashinfer.CUDAGraphBatchDecodeWithPagedKVCacheWrapper(
+                decode_workspace_buffer, indptr_buffer, indices_buffer, last_page_len_buffer, kv_layout="NHD",
+            )
+            self.graph_decode_wrappers[bs] = decode_wrapper
+
             graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            set_context(
+                False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs],
+                block_tables=block_tables[:bs], decode_wrapper=decode_wrapper,
+            )
+            # plan() itself is never captured (FlashInfer disallows it, see
+            # attention.py's docstring) -- called once here, eagerly, before
+            # both the warmup and capture forward passes below, which reuse
+            # this same planned state (identical dummy data either way, so
+            # nothing needs re-planning between them).
+            plan_decode(decode_wrapper, block_tables[:bs], context_lens[:bs], self.block_size, **self._decode_plan_kwargs)
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture

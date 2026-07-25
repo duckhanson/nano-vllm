@@ -40,32 +40,23 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
     store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
 
 
-_WORKSPACE_BYTES = 128 * 1024 * 1024
+WORKSPACE_BYTES = 128 * 1024 * 1024
 _prefill_wrapper = None
-_decode_wrapper = None
 _ragged_prefill_wrapper = None
 
 
 def _get_prefill_wrapper(device):
     global _prefill_wrapper
     if _prefill_wrapper is None:
-        buf = torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+        buf = torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device=device)
         _prefill_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(buf, kv_layout="NHD")
     return _prefill_wrapper
-
-
-def _get_decode_wrapper(device):
-    global _decode_wrapper
-    if _decode_wrapper is None:
-        buf = torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
-        _decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(buf, kv_layout="NHD")
-    return _decode_wrapper
 
 
 def _get_ragged_prefill_wrapper(device):
     global _ragged_prefill_wrapper
     if _ragged_prefill_wrapper is None:
-        buf = torch.empty(_WORKSPACE_BYTES, dtype=torch.uint8, device=device)
+        buf = torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device=device)
         _ragged_prefill_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(buf, kv_layout="NHD")
     return _ragged_prefill_wrapper
 
@@ -81,6 +72,39 @@ def _paged_kv_meta(block_tables: torch.Tensor, kv_lens: torch.Tensor, block_size
     return indptr, indices, last_page_len
 
 
+def plan_decode(
+    wrapper,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_size: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    sm_scale: float,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+) -> None:
+    """Plans one decode step's worth of FlashInfer paged-KV metadata on
+    `wrapper` -- called ONCE per decode step by ModelRunner.run_model(),
+    not once per layer. indptr/indices/last_page_len only depend on the
+    batch's block_tables/context_lens (identical across every transformer
+    layer within one step, see the module-level Attention docstring below),
+    so every layer's Attention._decode() reusing the same freshly-planned
+    wrapper (via context.decode_wrapper) is exact, not an approximation --
+    this hoists what used to be Attention._decode()'s own per-layer
+    wrapper.plan() call (2026-07-25, see DECISIONS-equivalent entry in
+    logs/: previously 32x redundant per-layer planning, independent of the
+    CUDA-graph question this hoist also unblocks -- see ModelRunner's
+    capture_cudagraph()/run_model())."""
+    indptr, indices, last_page_len = _paged_kv_meta(block_tables, context_lens, block_size)
+    wrapper.plan(
+        indptr, indices, last_page_len,
+        num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
+        head_dim=head_dim, page_size=block_size, sm_scale=sm_scale,
+        q_data_type=q_dtype, kv_data_type=kv_dtype,
+    )
+
+
 class Attention(nn.Module):
     """Attention math is FlashInfer's paged-KV-cache wrappers, reading/writing
     nano-vLLM's existing (num_blocks, block_size, num_kv_heads, head_dim) cache
@@ -89,7 +113,24 @@ class Attention(nn.Module):
     page table to read from; it uses the ragged (non-paged) prefill wrapper on
     q/k/v directly instead. GQA broadcast and causal masking (including the
     seqlen_q != seqlen_k prefix-cache case) are handled internally by FlashInfer.
-    enforce_eager=True only: plan()/run() are host-synchronous, not CUDA-graph-safe."""
+
+    Prefill (_prefill()) still plans its own wrapper per layer, unconditionally
+    eager -- FlashInfer's paged-prefill plan() is no more CUDA-graph-safe than
+    decode's, and unlike decode, ModelRunner.run_model() never captures the
+    prefill path at all (see its own branch), so hoisting prefill's planning
+    would add complexity with no CUDA-graph payoff. Decode (_decode()) instead
+    reads an already-planned wrapper off context.decode_wrapper (2026-07-25):
+    planning depends only on block_tables/context_lens, identical across every
+    layer within one decode step, so ModelRunner.run_model() calls
+    plan_decode() once per step (not once per layer, fixing the previous 32x
+    redundant per-layer planning) on whichever wrapper this step should use --
+    the eager singleton, or (when enforce_eager=False) the current batch
+    bucket's own CUDAGraphBatchDecodeWithPagedKVCacheWrapper, planned in eager
+    Python before capture_cudagraph()'s capture or run_model()'s graph.replay()
+    -- and stores it on context before calling into the model. This is what
+    makes decode CUDA-graph-safe: plan() itself is never captured, only run()
+    is (FlashInfer's plan()/run() are host-synchronous, not CUDA-graph-safe on
+    their own -- see plan_decode()'s own docstring above)."""
 
     def __init__(
         self,
@@ -129,16 +170,9 @@ class Attention(nn.Module):
         return wrapper.run(q, (self.k_cache, self.v_cache))
 
     def _decode(self, q: torch.Tensor, context) -> torch.Tensor:
-        block_size = self.k_cache.shape[1]
-        indptr, indices, last_page_len = _paged_kv_meta(context.block_tables, context.context_lens, block_size)
-        wrapper = _get_decode_wrapper(q.device)
-        wrapper.plan(
-            indptr, indices, last_page_len,
-            num_qo_heads=self.num_heads, num_kv_heads=self.num_kv_heads,
-            head_dim=self.head_dim, page_size=block_size, sm_scale=self.scale,
-            q_data_type=q.dtype, kv_data_type=self.k_cache.dtype,
-        )
-        return wrapper.run(q, (self.k_cache, self.v_cache))
+        # Already plan()ned by ModelRunner.run_model() before this forward
+        # pass started -- see plan_decode() and the class docstring above.
+        return context.decode_wrapper.run(q, (self.k_cache, self.v_cache))
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
