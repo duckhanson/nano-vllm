@@ -120,6 +120,19 @@ class ModelRunner:
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
+        # Built BEFORE the free-memory measurement below, so its 128MB
+        # workspace allocation is actually counted against num_kvcache_blocks'
+        # budget -- constructing it after (as an earlier version of this
+        # method did) silently left num_kvcache_blocks over-sized relative to
+        # what was really still free, since the measurement it's based on
+        # would predate this allocation (2026-07-25 real-hardware finding:
+        # this was enough to make a tight-margin real workload -- bm13's
+        # sequential-real-PG19-groups precompute -- run out of free blocks
+        # with `IndexError: pop from an empty deque`, once enforce_eager=False
+        # also started reserving graph-pool memory on top of this).
+        self._decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+            torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device="cuda"), kv_layout="NHD",
+        )
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
@@ -151,13 +164,6 @@ class ModelRunner:
             num_qo_heads=attn_module.num_heads, num_kv_heads=attn_module.num_kv_heads,
             head_dim=attn_module.head_dim, sm_scale=attn_module.scale,
             q_dtype=hf_config.dtype, kv_dtype=hf_config.dtype,
-        )
-        # Eager-mode decode wrapper: one shared singleton, matching the
-        # pre-2026-07-25 module-level global attention.py used to own --
-        # only its construction moved here, since plan_decode() call sites
-        # now all live in ModelRunner, not Attention._decode().
-        self._decode_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-            torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device="cuda"), kv_layout="NHD",
         )
 
     def prepare_block_tables(self, seqs: list[Sequence]):
