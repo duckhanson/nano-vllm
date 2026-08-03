@@ -143,7 +143,7 @@ class ModelRunner:
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
         kv_cache_shape = (2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
-        self.kv_cache, self.kv_cache_cpu_view = allocate_mapped_kv_cache(kv_cache_shape, hf_config.dtype)
+        self.kv_cache, self.kv_cache_cpu_view, self.kv_cache_shm_name = allocate_mapped_kv_cache(kv_cache_shape, hf_config.dtype)
         layer_id = 0
         attn_module = None
         for module in self.model.modules():
