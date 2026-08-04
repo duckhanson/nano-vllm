@@ -166,9 +166,19 @@ class ModelRunner:
             q_dtype=hf_config.dtype, kv_dtype=hf_config.dtype,
         )
 
+    def _block_table_row(self, seq: Sequence) -> list[int]:
+        # pass_offload/ADR-0030: a seq drafting this round (see
+        # prepare_decode()'s own comment) carries its own compacted,
+        # ready-set block row instead of its real (possibly not-yet-fully-
+        # resident) block_table -- duck-typed, this file never imports the
+        # attribute's type.
+        override = getattr(seq, "_draft_context_override", None)
+        return override.block_row if override is not None else seq.block_table
+
     def prepare_block_tables(self, seqs: list[Sequence]):
-        max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
+        rows = [self._block_table_row(seq) for seq in seqs]
+        max_len = max(len(row) for row in rows)
+        block_tables = [row + [-1] * (max_len - len(row)) for row in rows]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
@@ -216,15 +226,32 @@ class ModelRunner:
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
+        # pass_offload/ADR-0030: a seq may carry a `_draft_context_override`
+        # (input_token/position/slot/context_len/block_row) for this one
+        # call -- e.g. a still-resuming job drafting off its own compacted,
+        # ready-set KV view instead of its real (not-yet-fully-resident)
+        # one, sharing this same batched decode call with genuinely running
+        # seqs. This file has no concept of "draft" itself -- it only ever
+        # reads whichever of these two shapes a seq presents; see run()'s
+        # own _sample() for the matching split on the sampling side (a
+        # draft row must never share a real seq's sampler call -- see that
+        # method's own docstring for why).
         input_ids = []
         positions = []
         slot_mapping = []
         context_lens = []
         for seq in seqs:
-            input_ids.append(seq.last_token)
-            positions.append(len(seq) - 1)
-            context_lens.append(len(seq))
-            slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            override = getattr(seq, "_draft_context_override", None)
+            if override is None:
+                input_ids.append(seq.last_token)
+                positions.append(len(seq) - 1)
+                context_lens.append(len(seq))
+                slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
+            else:
+                input_ids.append(override.input_token)
+                positions.append(override.position)
+                context_lens.append(override.context_len)
+                slot_mapping.append(override.slot)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
@@ -286,11 +313,41 @@ class ModelRunner:
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
+    def _sample(self, seqs: list[Sequence], logits: torch.Tensor) -> list[int]:
+        # pass_offload/ADR-0030: rows carrying a `_draft_context_override`
+        # (see prepare_decode()) must be argmax'd directly off `logits`,
+        # never through self.sampler() -- routing every row through one
+        # shared sampler call regardless of draft rows being present would
+        # change that call's batch shape/size, consuming a different number
+        # of random draws from the same RNG stream even for the genuinely
+        # running rows in the same call. That would silently break their
+        # bit-exact match against a non-fused (vanilla) round using the same
+        # seed -- the soundness invariant self-spec's own real-hardware
+        # gates (SM5/SM9/SM10) depend on. Slicing the running rows out
+        # first keeps their own sampler() call identical in shape/order to
+        # what a round with no draft rows at all would have produced.
+        draft_idx = [i for i, seq in enumerate(seqs) if getattr(seq, "_draft_context_override", None) is not None]
+        if not draft_idx:
+            temperatures = self.prepare_sample(seqs)
+            return self.sampler(logits, temperatures).tolist()
+        draft_set = set(draft_idx)
+        decode_idx = [i for i in range(len(seqs)) if i not in draft_set]
+        token_ids = [0] * len(seqs)
+        if decode_idx:
+            decode_seqs = [seqs[i] for i in decode_idx]
+            temperatures = self.prepare_sample(decode_seqs)
+            decode_tokens = self.sampler(logits[decode_idx], temperatures).tolist()
+            for i, token_id in zip(decode_idx, decode_tokens):
+                token_ids[i] = token_id
+        draft_tokens = logits[draft_idx].float().argmax(dim=-1).tolist()
+        for i, token_id in zip(draft_idx, draft_tokens):
+            token_ids[i] = token_id
+        return token_ids
+
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
+        token_ids = self._sample(seqs, logits) if self.rank == 0 else None
         reset_context()
         return token_ids
 
