@@ -377,8 +377,19 @@ class ModelRunner:
         # 16), which run_model()'s own `next(x for x in self.graph_bs if x >=
         # bs)` bucket lookup then has no candidate for once a real batch size
         # lands there -- StopIteration (2026-08-05 real-hardware finding,
-        # pass_offload's own bs=6 sweep, max_num_seqs=12).
-        self.graph_bs = sorted(set([1, 2, 4, 8, max_bs] + list(range(16, max_bs + 1, 16))))
+        # pass_offload's own bs=6 sweep, max_num_seqs=12). The fixed prefix
+        # must itself be filtered to <= max_bs (2026-08-05 follow-up,
+        # max_num_seqs=4 crash): every buffer above (input_ids, positions,
+        # ...) is only max_bs wide, so a bucket bigger than max_bs would
+        # slice past the real batch and hand FlashInfer's paged-decode
+        # wrapper a row count that doesn't match what it was constructed
+        # for -- "batch size ... mismatches the batch size set during
+        # initialization" from flashinfer/decode.py's own plan().
+        self.graph_bs = sorted(
+            set(b for b in (1, 2, 4, 8) if b <= max_bs)
+            | {max_bs}
+            | set(range(16, max_bs + 1, 16))
+        )
         self.graphs = {}
         self.graph_pool = None
         self.graph_decode_wrappers = {}
