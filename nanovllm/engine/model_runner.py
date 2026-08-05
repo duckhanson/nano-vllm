@@ -372,7 +372,13 @@ class ModelRunner:
         # run_model()'s own graph branch for the equivalent replay-time fix).
         block_tables = torch.full((max_bs, max_num_blocks), -1, dtype=torch.int32)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        # `max_bs` itself is always included -- [1, 2, 4, 8] + range(16, ...)
+        # alone leaves a gap for any max_bs in [9, 15] (nothing >= 9 and <
+        # 16), which run_model()'s own `next(x for x in self.graph_bs if x >=
+        # bs)` bucket lookup then has no candidate for once a real batch size
+        # lands there -- StopIteration (2026-08-05 real-hardware finding,
+        # pass_offload's own bs=6 sweep, max_num_seqs=12).
+        self.graph_bs = sorted(set([1, 2, 4, 8, max_bs] + list(range(16, max_bs + 1, 16))))
         self.graphs = {}
         self.graph_pool = None
         self.graph_decode_wrappers = {}
