@@ -17,15 +17,22 @@ class Context:
     # Attention._decode() should call .run() on this step (see
     # model_runner.py's plan_decode() call sites). None during prefill.
     decode_wrapper: Any | None = None
+    # pass_offload/ADR-0031: is_prefill=True mode only. The already-plan()ned
+    # CUDA-graph-enabled paged-prefill/append wrapper every layer's
+    # Attention.forward() should call .run() on this step, for the mixed
+    # decode+draft+verify batch (see model_runner.py's plan_mixed_extend()
+    # call site). None for a genuine (non-mixed) prefill, in which case
+    # Attention._prefill() plans its own wrapper eagerly per layer as before.
+    extend_wrapper: Any | None = None
 
 _CONTEXT = Context()
 
 def get_context():
     return _CONTEXT
 
-def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None, decode_wrapper=None):
+def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0, max_seqlen_k=0, slot_mapping=None, context_lens=None, block_tables=None, decode_wrapper=None, extend_wrapper=None):
     global _CONTEXT
-    _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables, decode_wrapper)
+    _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables, decode_wrapper, extend_wrapper)
 
 def reset_context():
     global _CONTEXT

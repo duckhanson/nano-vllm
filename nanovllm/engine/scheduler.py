@@ -78,8 +78,13 @@ class Scheduler:
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
-        for seq, token_id in zip(seqs, token_ids):
+    def postprocess(self, seqs: list[Sequence], token_ids: list[list[int]], is_prefill: bool):
+        # pass_offload/ADR-0031: ModelRunner.run() always returns one list of
+        # token ids per row now (length 1 here -- this base scheduler never
+        # produces a verify row, whose own list would be longer; see
+        # OffloadScheduler.postprocess() for that case).
+        for seq, token_ids_row in zip(seqs, token_ids):
+            token_id = token_ids_row[0]
             self.block_manager.hash_blocks(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0

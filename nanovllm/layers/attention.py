@@ -67,7 +67,20 @@ def _paged_kv_meta(block_tables: torch.Tensor, kv_lens: torch.Tensor, block_size
     num_pages = (kv_lens + block_size - 1) // block_size
     indptr = torch.zeros(kv_lens.numel() + 1, dtype=torch.int32, device=kv_lens.device)
     indptr[1:] = torch.cumsum(num_pages, dim=0)
-    last_page_len = (kv_lens - (num_pages - 1) * block_size).to(torch.int32)
+    # pass_offload/ADR-0031 follow-up: `(num_pages - 1)` alone goes negative
+    # for a zero-context row (num_pages=0), making this line read back
+    # `block_size` instead of 0 for such a row's last_page_len -- harmless
+    # for plan_decode()'s own existing zero-context padding rows (decode's
+    # wrapper never derives a scheduling length from this value the way the
+    # paged-prefill/append wrapper's own planner does), but wrong for
+    # plan_mixed_extend()'s zero-context padding rows: FlashInfer's
+    # `get_seq_lens` (flashinfer/page.py) adds last_page_len to a zero-page
+    # row's length unconditionally, so a nonzero garbage value here reads
+    # back as "this row has real KV length with no backing page index" --
+    # confirmed via a real-hardware probe (see docs/adr/0031...). Clamping
+    # to >= 0 fixes the zero-context case without changing any nonzero-row
+    # result (verified: for num_pages >= 1 this clamp is a no-op).
+    last_page_len = (kv_lens - torch.clamp(num_pages - 1, min=0) * block_size).to(torch.int32)
     indices = block_tables[block_tables >= 0].to(torch.int32)
     return indptr, indices, last_page_len
 
@@ -105,6 +118,39 @@ def plan_decode(
     )
 
 
+def plan_mixed_extend(
+    wrapper,
+    qo_indptr: torch.Tensor,
+    block_tables: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_size: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    sm_scale: float,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+) -> None:
+    """pass_offload/ADR-0031: plans one round's worth of FlashInfer paged-KV
+    metadata for the mixed decode+draft+verify batch on `wrapper` -- called
+    ONCE per round by ModelRunner.run_model(), mirroring plan_decode()'s own
+    hoist (same rationale: identical across every layer, so per-layer
+    replanning would be redundant). Unlike plan_decode(), query length is
+    ragged per row (1 for decode/draft rows, N+1 for verify rows) -- encoded
+    via `qo_indptr` the same way a genuine prefill's cu_seqlens_q already is
+    (see ModelRunner.prepare_prefill()). KV paging reuses _paged_kv_meta(),
+    identical page-table math to plan_decode() -- decode is just this
+    function's own degenerate query_len=1 case, not a different kernel
+    problem (ADR-0031's own "facts established" section)."""
+    indptr, indices, last_page_len = _paged_kv_meta(block_tables, context_lens, block_size)
+    wrapper.plan(
+        qo_indptr, indptr, indices, last_page_len,
+        num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim, page_size=block_size, causal=True, sm_scale=sm_scale,
+        q_data_type=q_dtype, kv_data_type=kv_dtype,
+    )
+
+
 class Attention(nn.Module):
     """Attention math is FlashInfer's paged-KV-cache wrappers, reading/writing
     nano-vLLM's existing (num_blocks, block_size, num_kv_heads, head_dim) cache
@@ -114,23 +160,35 @@ class Attention(nn.Module):
     q/k/v directly instead. GQA broadcast and causal masking (including the
     seqlen_q != seqlen_k prefix-cache case) are handled internally by FlashInfer.
 
-    Prefill (_prefill()) still plans its own wrapper per layer, unconditionally
-    eager -- FlashInfer's paged-prefill plan() is no more CUDA-graph-safe than
-    decode's, and unlike decode, ModelRunner.run_model() never captures the
-    prefill path at all (see its own branch), so hoisting prefill's planning
-    would add complexity with no CUDA-graph payoff. Decode (_decode()) instead
-    reads an already-planned wrapper off context.decode_wrapper (2026-07-25):
-    planning depends only on block_tables/context_lens, identical across every
-    layer within one decode step, so ModelRunner.run_model() calls
-    plan_decode() once per step (not once per layer, fixing the previous 32x
-    redundant per-layer planning) on whichever wrapper this step should use --
-    the eager singleton, or (when enforce_eager=False) the current batch
-    bucket's own CUDAGraphBatchDecodeWithPagedKVCacheWrapper, planned in eager
-    Python before capture_cudagraph()'s capture or run_model()'s graph.replay()
-    -- and stores it on context before calling into the model. This is what
+    A genuine prefill (_prefill(), real prompt tokens) still plans its own
+    wrapper per layer, unconditionally eager -- ModelRunner.run_model() never
+    captures that path in a CUDA graph (see its own branch), so hoisting its
+    planning would add complexity with no payoff there. Decode (_decode())
+    instead reads an already-planned wrapper off context.decode_wrapper
+    (2026-07-25): planning depends only on block_tables/context_lens,
+    identical across every layer within one decode step, so
+    ModelRunner.run_model() calls plan_decode() once per step (not once per
+    layer, fixing the previous 32x redundant per-layer planning) on whichever
+    wrapper this step should use -- the eager singleton, or (when
+    enforce_eager=False) the current batch bucket's own
+    CUDAGraphBatchDecodeWithPagedKVCacheWrapper, planned in eager Python
+    before capture_cudagraph()'s capture or run_model()'s graph.replay() --
+    and stores it on context before calling into the model. This is what
     makes decode CUDA-graph-safe: plan() itself is never captured, only run()
     is (FlashInfer's plan()/run() are host-synchronous, not CUDA-graph-safe on
-    their own -- see plan_decode()'s own docstring above)."""
+    their own -- see plan_decode()'s own docstring above).
+
+    pass_offload/ADR-0031: FlashInfer's paged-prefill wrapper (BatchPrefill-
+    WithPagedKVCacheWrapper) natively supports use_cuda_graph=True with the
+    same plan-once/run-captured split decode already uses -- an earlier
+    version of this docstring claimed otherwise; that described this
+    project's prior usage, not a real FlashInfer limitation. The mixed
+    decode+draft+verify batch (_mixed_extend()) exploits this: its wrapper is
+    planned once per round via plan_mixed_extend() (ModelRunner.run_model(),
+    mirroring plan_decode()'s hoist) and read off context.extend_wrapper the
+    same way _decode() reads context.decode_wrapper -- a genuine prefill
+    (context.extend_wrapper is None) is unaffected and still plans eagerly
+    per layer as always."""
 
     def __init__(
         self,
@@ -174,12 +232,27 @@ class Attention(nn.Module):
         # pass started -- see plan_decode() and the class docstring above.
         return context.decode_wrapper.run(q, (self.k_cache, self.v_cache))
 
+    def _mixed_extend(self, q: torch.Tensor, context) -> torch.Tensor:
+        # pass_offload/ADR-0031: already plan()ned by ModelRunner.run_model()
+        # before this forward pass started, via plan_mixed_extend() -- same
+        # "planned once per round, not once per layer" discipline as
+        # _decode()/context.decode_wrapper above, applied to the mixed
+        # decode+draft+verify batch's ragged-query-length wrapper instead.
+        return context.extend_wrapper.run(q, (self.k_cache, self.v_cache))
+
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
+            # pass_offload/ADR-0031: extend_wrapper is only ever set for the
+            # mixed decode+draft+verify batch (see model_runner.py's
+            # prepare_mixed_extend()) -- a genuine prefill (real prompt
+            # tokens) never sets it and falls through to the existing eager
+            # per-layer _prefill() path unchanged.
+            if context.extend_wrapper is not None:
+                return self._mixed_extend(q, context)
             return self._prefill(q, k, v, context)
         else:    # decode
             return self._decode(q, context)
