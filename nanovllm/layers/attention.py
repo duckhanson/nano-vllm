@@ -43,6 +43,12 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
 WORKSPACE_BYTES = 128 * 1024 * 1024
 _prefill_wrapper = None
 _ragged_prefill_wrapper = None
+# Diagnostic-only (2026-08-19, chunking regression investigation): toggled
+# from a test/script via `attention._CHUNK_FIX_DEBUG["on"] = True`, never
+# read/written by production code. Left in place (off by default) since
+# investigation into the multi-position ragged verify-span divergence is
+# still open -- see ADR-0033 memory layout redesign's own status notes.
+_CHUNK_FIX_DEBUG = {"on": False}
 
 
 def _get_prefill_wrapper(device):
@@ -151,6 +157,71 @@ def plan_mixed_extend(
     )
 
 
+def plan_chunk_long(
+    wrapper,
+    qo_indptr: torch.Tensor,
+    long_block_tables: torch.Tensor,
+    long_context_lens: torch.Tensor,
+    block_size: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    sm_scale: float,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+) -> None:
+    """pass_offload/ADR-0033 memory layout redesign: plans the "long region"
+    half of the two-level attention correctness fix for chunk-granularity
+    extension storage (see Attention._apply_chunk_fix()'s own docstring for
+    the full correctness argument). Non-causal -- every masked token's own
+    reach includes the WHOLE long region unconditionally (it's temporally
+    before all of it), not a query-index-dependent prefix -- over each
+    fixed-up row's own real block_table (no chunk entry at all: the chunk
+    region is handled separately by plan_chunk_short()). A row with no
+    chunk fix this round gets long_context_lens equal to its own real full
+    context length here, which is harmless -- context.chunk_mask being
+    False for all of that row's tokens means _apply_chunk_fix() never reads
+    this wrapper's output for it. Called once per round by
+    ModelRunner.run_model(), mirroring plan_decode()/plan_mixed_extend()'s
+    own hoist (identical across every transformer layer)."""
+    indptr, indices, last_page_len = _paged_kv_meta(long_block_tables, long_context_lens, block_size)
+    wrapper.plan(
+        qo_indptr, indptr, indices, last_page_len,
+        num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim, page_size=block_size, causal=False, sm_scale=sm_scale,
+        q_data_type=q_dtype, kv_data_type=kv_dtype,
+    )
+
+
+def plan_chunk_short(
+    wrapper,
+    qo_indptr: torch.Tensor,
+    chunk_kv_indptr: torch.Tensor,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    sm_scale: float,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+) -> None:
+    """pass_offload/ADR-0033 memory layout redesign: plans the "chunk
+    region" half of the two-level attention fix -- causal, ragged (each
+    fixed-up row contributes only its own <=CHUNK_SIZE valid bytes,
+    `chunk_kv_indptr` encodes exactly that per-row length, 0 for a row with
+    no chunk fix this round), no page table at all (BatchPrefillWithRagged
+    KVCacheWrapper) since the chunk region is gathered directly by tensor
+    indexing in Attention._apply_chunk_fix(), bypassing the paged
+    mechanism's offset-0 assumption entirely -- that assumption is exactly
+    what's unsafe for a chunk sharing a physical block with another
+    branch's chunk at a different offset."""
+    wrapper.plan(
+        qo_indptr, chunk_kv_indptr,
+        num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim, causal=True, sm_scale=sm_scale,
+        q_data_type=q_dtype, kv_data_type=kv_dtype,
+    )
+
+
 class Attention(nn.Module):
     """Attention math is FlashInfer's paged-KV-cache wrappers, reading/writing
     nano-vLLM's existing (num_blocks, block_size, num_kv_heads, head_dim) cache
@@ -227,10 +298,99 @@ class Attention(nn.Module):
         )
         return wrapper.run(q, (self.k_cache, self.v_cache))
 
+    def _apply_chunk_fix(self, q: torch.Tensor, out: torch.Tensor, context) -> torch.Tensor:
+        """pass_offload/ADR-0033 memory layout redesign: two-level
+        attention correctness fix for chunk-granularity extension storage.
+
+        A row's KV history splits into two disjoint regions: the LONG
+        region (seq.block_table-resident content, whole real blocks, never
+        chunk-shared -- the primary wrapper's own offset-0 paged read
+        above is already exactly correct here) and the CHUNK region (the
+        branch's own <=CHUNK_SIZE-token extension chunk, possibly sharing
+        a physical block with an unrelated branch's chunk at a different
+        offset). FlashInfer always reads a row's terminal page starting at
+        physical offset 0 -- so for any query position whose reach touches
+        a chunk at a NONZERO offset, the primary wrapper's own read above
+        reads the WRONG physical bytes (a sibling branch's chunk content,
+        or garbage), not just an incomplete one.
+
+        This means the fix is NOT a merge into the primary pass's own
+        output: that output is already wrong (not a valid partial
+        attention over a real KV subset) for exactly the tokens that need
+        fixing, so it can't be one operand of merge_state for them. The
+        correct assembly is a masked OVERWRITE -- untouched tokens
+        (context.chunk_mask False) keep `out` exactly as the primary pass
+        already computed it; only masked tokens get replaced by a fresh
+        two-level result: a non-causal, fixed-length read over the LONG
+        region (every masked token's reach includes the whole long region
+        unconditionally) merged via flashinfer.merge_state with a causal,
+        growing read over just the CHUNK region's own valid bytes, gathered
+        by direct tensor indexing at (chunk_block_id, chunk_offset) --
+        bypassing the paged mechanism's offset-0 assumption entirely, since
+        it's raw indexing, not a paged read.
+
+        `context.has_chunk_fix` (a plain Python bool) gates this, never
+        `context.chunk_mask.any()` -- that would force a device-to-host
+        sync on a CUDA tensor, and this runs once per transformer layer,
+        every round, even when nothing needs fixing (real-hardware
+        regression, 2026-08-19: this was enough sync overhead to starve
+        propose_batch() of the few real draft rounds the scheduling
+        soundness gate's own tight inter-swap-in-wave timing depends on).
+
+        Real-hardware regression #2 (2026-08-19, ragged multi-position
+        verify/branch-out spans specifically -- draft rows, qo_len=1, were
+        never affected): chunk_short_wrapper must be run on ONLY the masked
+        query positions (exactly `valid_len` of them per row -- the row's
+        own trailing suffix), not the row's full qo_len. FlashInfer's
+        ragged causal convention assumes kv_len >= qo_len (every query has
+        a corresponding, growing key count, e.g. genuine prefix-caching);
+        feeding it kv_len (== valid_len) < qo_len (the row's full span,
+        including leading positions that touch zero chunk content) falls
+        outside that convention and silently corrupts results for every
+        query in the row, not just the out-of-range leading ones -- caught
+        via a real target-verify divergence in the scheduling soundness
+        gate (two identical-context verify calls disagreeing on the token
+        immediately after a shared prefix). Gathering q down to exactly
+        the masked positions makes qo_len == kv_len == valid_len per row,
+        the same shape chunk_kv_indptr (used for both wrapper's own
+        qo_indptr and kv_indptr, see model_runner.py's plan_chunk_short()
+        call sites) already assumes."""
+        if not context.has_chunk_fix:
+            return out
+        flat_k = self.k_cache.view(-1, self.num_kv_heads, self.head_dim)
+        flat_v = self.v_cache.view(-1, self.num_kv_heads, self.head_dim)
+        chunk_k = flat_k[context.chunk_slot_mapping]
+        chunk_v = flat_v[context.chunk_slot_mapping]
+        v_long, lse_long = context.chunk_long_wrapper.run(q, (self.k_cache, self.v_cache), return_lse=True)
+        # BatchPrefillWithRaggedKVCacheWrapper.run() takes k/v as separate
+        # positional args, not a (k, v) tuple like the paged wrapper above
+        # -- confirmed against attention.py's own _prefill() warmup path,
+        # which already calls the ragged wrapper this same way.
+        q_masked = q[context.chunk_mask]
+        v_short, lse_short = context.chunk_short_wrapper.run(q_masked, chunk_k, chunk_v, return_lse=True)
+        v_fix, _ = flashinfer.merge_state(v_long[context.chunk_mask], lse_long[context.chunk_mask], v_short, lse_short)
+        out = out.clone()
+        out[context.chunk_mask] = v_fix
+        if _CHUNK_FIX_DEBUG["on"]:
+            print(
+                f"[chunk-fix-debug] chunk_k.shape={tuple(chunk_k.shape)} "
+                f"chunk_slot_mapping={context.chunk_slot_mapping.tolist()} "
+                f"chunk_kv_indptr={context.chunk_kv_indptr.tolist()} "
+                f"chunk_qo_indptr={context.chunk_qo_indptr.tolist()} "
+                f"chunk_k[:,0,:4]={chunk_k[:, 0, :4].tolist()} "
+                f"v_long_masked.norm={v_long[context.chunk_mask].norm().item():.4f} "
+                f"lse_long_masked={lse_long[context.chunk_mask].flatten()[:4].tolist()} "
+                f"v_short.norm={v_short.norm().item():.4f} "
+                f"lse_short={lse_short.flatten()[:4].tolist()} "
+                f"v_fix.norm={v_fix.norm().item():.4f}"
+            )
+        return out
+
     def _decode(self, q: torch.Tensor, context) -> torch.Tensor:
         # Already plan()ned by ModelRunner.run_model() before this forward
         # pass started -- see plan_decode() and the class docstring above.
-        return context.decode_wrapper.run(q, (self.k_cache, self.v_cache))
+        out = context.decode_wrapper.run(q, (self.k_cache, self.v_cache))
+        return self._apply_chunk_fix(q, out, context)
 
     def _mixed_extend(self, q: torch.Tensor, context) -> torch.Tensor:
         # pass_offload/ADR-0031: already plan()ned by ModelRunner.run_model()
@@ -238,7 +398,8 @@ class Attention(nn.Module):
         # "planned once per round, not once per layer" discipline as
         # _decode()/context.decode_wrapper above, applied to the mixed
         # decode+draft+verify batch's ragged-query-length wrapper instead.
-        return context.extend_wrapper.run(q, (self.k_cache, self.v_cache))
+        out = context.extend_wrapper.run(q, (self.k_cache, self.v_cache))
+        return self._apply_chunk_fix(q, out, context)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()

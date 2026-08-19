@@ -10,7 +10,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.llama import LlamaForCausalLM
-from nanovllm.layers.attention import WORKSPACE_BYTES, plan_decode, plan_mixed_extend
+from nanovllm.layers.attention import WORKSPACE_BYTES, plan_decode, plan_mixed_extend, plan_chunk_long, plan_chunk_short
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -158,6 +158,22 @@ class ModelRunner:
         self._extend_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device="cuda"), kv_layout="NHD",
         )
+        # pass_offload/ADR-0033 memory layout redesign: eager singletons for
+        # the two-level attention correctness fix (chunk-granularity
+        # extension storage packed into a shared physical block) -- same
+        # "built here, not lazily" convention as _decode_wrapper/
+        # _extend_wrapper above, one shared pair reused for both decode and
+        # mixed-extend rounds (decode is this mechanism's own qo_len=1
+        # degenerate case, mirroring plan_mixed_extend()'s own framing).
+        # Eager-path only for now (see run_model()'s own comment) --
+        # CUDA-graph bucketing for this mechanism is deliberately deferred
+        # to a future phase.
+        self._chunk_long_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+            torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device="cuda"), kv_layout="NHD",
+        )
+        self._chunk_short_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+            torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device="cuda"), kv_layout="NHD",
+        )
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
@@ -207,12 +223,14 @@ class ModelRunner:
         override = getattr(seq, "_draft_context_override", None)
         return override.block_row if override is not None else seq.block_table
 
+    def _pad_rows_to_tensor(self, rows: list[list[int]]) -> torch.Tensor:
+        max_len = max(len(row) for row in rows)
+        padded = [row + [-1] * (max_len - len(row)) for row in rows]
+        return torch.tensor(padded, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
     def prepare_block_tables(self, seqs: list[Sequence]):
         rows = [self._block_table_row(seq) for seq in seqs]
-        max_len = max(len(row) for row in rows)
-        block_tables = [row + [-1] * (max_len - len(row)) for row in rows]
-        block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        return block_tables
+        return self._pad_rows_to_tensor(rows)
 
     def prepare_prefill(self, seqs: list[Sequence]):
         input_ids = []
@@ -257,6 +275,73 @@ class ModelRunner:
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
+    def _build_chunk_fix_tensors(self, chunk_fixes, fallback_rows, fallback_context_lens, token_positions):
+        """pass_offload/ADR-0033 memory layout redesign: builds the tensors
+        plan_chunk_long()/plan_chunk_short()/Attention._apply_chunk_fix()
+        need, from each row's own ChunkFix (or None, meaning that row needs
+        no fix this round). chunk_fixes[i]/fallback_rows[i]/
+        fallback_context_lens[i]/token_positions[i] all align by row index;
+        token_positions[i] is the list of absolute position(s) row i
+        contributes to this round's flat batch, in append order -- used to
+        decide, per token, whether its own causal reach touches row i's
+        chunk (position >= chunk_fix.long_kv_len -- see Attention._apply_
+        chunk_fix()'s own docstring for the full correctness argument).
+        fallback_rows/fallback_context_lens are that row's own real, full
+        block_row/context_len, used for the long-region plan when the row
+        has no chunk fix -- never actually read in that case (chunk_mask is
+        False for all of its tokens), but must still be well-formed."""
+        chunk_mask = []
+        chunk_valid_lens = []
+        chunk_qo_lens = []
+        chunk_slot_mapping = []
+        long_block_tables_rows = []
+        long_context_lens = []
+        # Plain Python bool -- see Context.has_chunk_fix's own comment for
+        # why this must never be replaced by a `chunk_mask.any()` GPU-tensor
+        # check (real-hardware regression: forces a device-to-host sync,
+        # ruinous when checked once per transformer layer every round).
+        has_chunk_fix = any(cf is not None for cf in chunk_fixes)
+        for chunk_fix, row, context_len, positions in zip(
+            chunk_fixes, fallback_rows, fallback_context_lens, token_positions
+        ):
+            if chunk_fix is None:
+                chunk_mask.extend([False] * len(positions))
+                chunk_valid_lens.append(0)
+                chunk_qo_lens.append(0)
+                long_block_tables_rows.append(row)
+                long_context_lens.append(context_len)
+                continue
+            row_mask = [pos >= chunk_fix.long_kv_len for pos in positions]
+            chunk_mask.extend(row_mask)
+            chunk_valid_lens.append(chunk_fix.valid_len)
+            # Real-hardware regression (2026-08-19, see Attention._apply_
+            # chunk_fix()'s own docstring): the ragged chunk wrapper's own
+            # qo_len per row is how many of THIS row's positions are
+            # actually masked -- NOT chunk_fix.valid_len. For a decode/
+            # draft row (always exactly 1 position, masked as a whole
+            # whenever chunk_fix is present) these differ: qo_len=1 while
+            # valid_len can be up to CHUNK_SIZE. They only coincide for a
+            # verify/branch-out row's ragged multi-position span (masked
+            # positions are provably exactly that row's own trailing
+            # valid_len-sized sub-range).
+            chunk_qo_lens.append(sum(row_mask))
+            base = chunk_fix.block_id * self.block_size + chunk_fix.offset
+            chunk_slot_mapping.extend(range(base, base + chunk_fix.valid_len))
+            long_block_tables_rows.append(chunk_fix.long_block_row)
+            long_context_lens.append(chunk_fix.long_kv_len)
+
+        chunk_mask = torch.tensor(chunk_mask, dtype=torch.bool, pin_memory=True).cuda(non_blocking=True)
+        chunk_kv_indptr = torch.zeros(len(chunk_valid_lens) + 1, dtype=torch.int32)
+        chunk_kv_indptr[1:] = torch.tensor(chunk_valid_lens, dtype=torch.int32).cumsum(dim=0)
+        chunk_kv_indptr = chunk_kv_indptr.pin_memory().cuda(non_blocking=True)
+        chunk_qo_indptr = torch.zeros(len(chunk_qo_lens) + 1, dtype=torch.int32)
+        chunk_qo_indptr[1:] = torch.tensor(chunk_qo_lens, dtype=torch.int32).cumsum(dim=0)
+        chunk_qo_indptr = chunk_qo_indptr.pin_memory().cuda(non_blocking=True)
+        chunk_slot_mapping = torch.tensor(chunk_slot_mapping, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        long_block_tables = self._pad_rows_to_tensor(long_block_tables_rows)
+        long_context_lens = torch.tensor(long_context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        return chunk_mask, chunk_slot_mapping, long_block_tables, long_context_lens, chunk_kv_indptr, chunk_qo_indptr, has_chunk_fix
+
     def prepare_decode(self, seqs: list[Sequence]):
         # pass_offload/ADR-0030: a seq may carry a `_draft_context_override`
         # (input_token/position/slot/context_len/block_row) for this one
@@ -272,6 +357,8 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
+        chunk_fixes = []
+        fallback_rows = []
         for seq in seqs:
             override = getattr(seq, "_draft_context_override", None)
             if override is None:
@@ -279,17 +366,36 @@ class ModelRunner:
                 positions.append(len(seq) - 1)
                 context_lens.append(len(seq))
                 slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
+                chunk_fixes.append(None)
+                fallback_rows.append(seq.block_table)
             else:
                 input_ids.append(override.input_token)
                 positions.append(override.position)
                 context_lens.append(override.context_len)
                 slot_mapping.append(override.slot)
+                chunk_fixes.append(override.chunk_fix)
+                fallback_rows.append(override.block_row)
+        chunk_mask, chunk_slot_mapping, chunk_long_block_tables, chunk_long_context_lens, chunk_kv_indptr, chunk_qo_indptr, has_chunk_fix = (
+            self._build_chunk_fix_tensors(chunk_fixes, fallback_rows, context_lens, [[p] for p in positions])
+        )
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        # ADR-0033 memory layout redesign: cu_seqlens_q was previously never
+        # populated during decode (nothing read it) -- plan_chunk_long()/
+        # plan_chunk_short() need a qo_indptr, and decode's is simply
+        # arange(num_rows+1) (query_len=1 per row). Confirmed safe to start
+        # populating: embed_head.py's own cu_seqlens_q read is prefill-only
+        # (is_prefill=True), and nothing else touches it during decode.
+        cu_seqlens_q = torch.arange(len(seqs) + 1, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        set_context(
+            False, cu_seqlens_q=cu_seqlens_q, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables,
+            chunk_mask=chunk_mask, chunk_slot_mapping=chunk_slot_mapping, has_chunk_fix=has_chunk_fix,
+            chunk_long_block_tables=chunk_long_block_tables, chunk_long_context_lens=chunk_long_context_lens,
+            chunk_kv_indptr=chunk_kv_indptr, chunk_qo_indptr=chunk_qo_indptr,
+        )
         return input_ids, positions
 
     def prepare_mixed_extend(self, seqs: list[Sequence]):
@@ -312,6 +418,9 @@ class ModelRunner:
         slot_mapping = []
         cu_seqlens_q = [0]
         context_lens = []
+        chunk_fixes = []
+        fallback_rows = []
+        token_positions = []
         for seq in seqs:
             verify = getattr(seq, "_verify_context_override", None)
             if verify is not None:
@@ -320,6 +429,9 @@ class ModelRunner:
                 slot_mapping.extend(verify.slot_mapping)
                 cu_seqlens_q.append(cu_seqlens_q[-1] + len(verify.input_tokens))
                 context_lens.append(verify.num_cached_tokens + len(verify.input_tokens))
+                chunk_fixes.append(verify.chunk_fix)
+                fallback_rows.append(verify.block_row)
+                token_positions.append(list(verify.positions))
                 continue
             draft = getattr(seq, "_draft_context_override", None)
             if draft is not None:
@@ -327,19 +439,33 @@ class ModelRunner:
                 positions.append(draft.position)
                 slot_mapping.append(draft.slot)
                 context_lens.append(draft.context_len)
+                chunk_fixes.append(draft.chunk_fix)
+                fallback_rows.append(draft.block_row)
+                token_positions.append([draft.position])
             else:
                 input_ids.append(seq.last_token)
                 positions.append(len(seq) - 1)
                 slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
                 context_lens.append(len(seq))
+                chunk_fixes.append(None)
+                fallback_rows.append(seq.block_table)
+                token_positions.append([len(seq) - 1])
             cu_seqlens_q.append(cu_seqlens_q[-1] + 1)
+        chunk_mask, chunk_slot_mapping, chunk_long_block_tables, chunk_long_context_lens, chunk_kv_indptr, chunk_qo_indptr, has_chunk_fix = (
+            self._build_chunk_fix_tensors(chunk_fixes, fallback_rows, context_lens, token_positions)
+        )
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(True, cu_seqlens_q=cu_seqlens_q, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        set_context(
+            True, cu_seqlens_q=cu_seqlens_q, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables,
+            chunk_mask=chunk_mask, chunk_slot_mapping=chunk_slot_mapping, has_chunk_fix=has_chunk_fix,
+            chunk_long_block_tables=chunk_long_block_tables, chunk_long_context_lens=chunk_long_context_lens,
+            chunk_kv_indptr=chunk_kv_indptr, chunk_qo_indptr=chunk_qo_indptr,
+        )
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -384,8 +510,47 @@ class ModelRunner:
                     self.block_size, **self._decode_plan_kwargs,
                 )
                 context.extend_wrapper = self._extend_wrapper
+                # ADR-0033 memory layout redesign: two-level attention fix,
+                # eager path only (see class docstring in attention.py's
+                # Attention._apply_chunk_fix() for the full correctness
+                # argument) -- planned only when at least one row actually
+                # needs it this round. Gated on context.has_chunk_fix (a
+                # plain Python bool computed on the CPU side), never
+                # `chunk_mask.any()` -- that forces a device-to-host sync on
+                # a CUDA tensor (real-hardware regression, 2026-08-19).
+                if context.has_chunk_fix:
+                    plan_chunk_long(
+                        self._chunk_long_wrapper, context.cu_seqlens_q, context.chunk_long_block_tables,
+                        context.chunk_long_context_lens, self.block_size, **self._decode_plan_kwargs,
+                    )
+                    # qo_indptr is chunk_qo_indptr (masked-position count per
+                    # row), NOT context.cu_seqlens_q (the row's full span) --
+                    # the ragged causal wrapper only ever sees the masked
+                    # query positions (Attention._apply_chunk_fix() gathers q
+                    # down to context.chunk_mask before calling .run()).
+                    # chunk_qo_indptr != chunk_kv_indptr in general (a
+                    # decode/draft row has exactly 1 masked query position
+                    # but can have up to CHUNK_SIZE valid chunk KV tokens) --
+                    # real-hardware regression, 2026-08-19, see that
+                    # method's own docstring.
+                    plan_chunk_short(
+                        self._chunk_short_wrapper, context.chunk_qo_indptr, context.chunk_kv_indptr,
+                        **self._decode_plan_kwargs,
+                    )
+                    context.chunk_long_wrapper = self._chunk_long_wrapper
+                    context.chunk_short_wrapper = self._chunk_short_wrapper
                 hidden = self.model(input_ids, positions)
             else:
+                # ADR-0033 memory layout redesign: the two-level attention
+                # fix's CUDA-graph bucketing is deliberately deferred to a
+                # future phase (see ADR's own staging note) -- fail loud
+                # here rather than silently crash on chunk_long_wrapper
+                # being None inside Attention._apply_chunk_fix().
+                assert not context.has_chunk_fix, (
+                    "two-level attention chunk fix not yet supported under "
+                    "CUDA graph capture (enforce_eager=False) -- ADR-0033 "
+                    "memory layout redesign, deferred to a future phase"
+                )
                 # pass_offload/ADR-0031 follow-up: CUDA-graph bucketed by
                 # total flattened query-token count, not row count (a verify
                 # row's own N has no fixed ceiling the way row count does --
@@ -449,10 +614,41 @@ class ModelRunner:
                     self.block_size, **self._decode_plan_kwargs,
                 )
                 context.decode_wrapper = self._decode_wrapper
+                # ADR-0033 memory layout redesign: same eager-only two-level
+                # attention fix as the mixed-extend branch above.
+                if context.has_chunk_fix:
+                    plan_chunk_long(
+                        self._chunk_long_wrapper, context.cu_seqlens_q, context.chunk_long_block_tables,
+                        context.chunk_long_context_lens, self.block_size, **self._decode_plan_kwargs,
+                    )
+                    # qo_indptr is chunk_qo_indptr (masked-position count per
+                    # row), NOT context.cu_seqlens_q (the row's full span) --
+                    # the ragged causal wrapper only ever sees the masked
+                    # query positions (Attention._apply_chunk_fix() gathers q
+                    # down to context.chunk_mask before calling .run()).
+                    # chunk_qo_indptr != chunk_kv_indptr in general (a
+                    # decode/draft row has exactly 1 masked query position
+                    # but can have up to CHUNK_SIZE valid chunk KV tokens) --
+                    # real-hardware regression, 2026-08-19, see that
+                    # method's own docstring.
+                    plan_chunk_short(
+                        self._chunk_short_wrapper, context.chunk_qo_indptr, context.chunk_kv_indptr,
+                        **self._decode_plan_kwargs,
+                    )
+                    context.chunk_long_wrapper = self._chunk_long_wrapper
+                    context.chunk_short_wrapper = self._chunk_short_wrapper
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
             context = get_context()
+            # ADR-0033 memory layout redesign: CUDA-graph bucketing for the
+            # two-level attention fix is deliberately deferred -- fail loud
+            # rather than silently crash on chunk_long_wrapper being None.
+            assert not context.has_chunk_fix, (
+                "two-level attention chunk fix not yet supported under "
+                "CUDA graph capture (enforce_eager=False) -- ADR-0033 "
+                "memory layout redesign, deferred to a future phase"
+            )
             bucket_bs = next(x for x in self.graph_bs if x >= bs)
             graph = self.graphs[bucket_bs]
             decode_wrapper = self.graph_decode_wrappers[bucket_bs]
