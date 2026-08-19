@@ -352,14 +352,33 @@ class ModelRunner:
         if is_mixed_extend:
             context = get_context()
             total_tokens = input_ids.size(0)
-            if self.enforce_eager or total_tokens > self.graph_extend_tokens[-1]:
+            num_rows = context.block_tables.size(0)
+            if self.enforce_eager or total_tokens > self.graph_extend_tokens[-1] or num_rows > self.max_bs:
                 # pass_offload/ADR-0031: eager fallback -- enforce_eager, or a
                 # round whose total flattened query-token count exceeds even
                 # this path's largest captured bucket (mirrors the decode
-                # branch's own `input_ids.size(0) > 512` eager fallback
-                # below). One plan() per round (not per layer), mirroring
-                # plan_decode()'s existing hoist -- see plan_mixed_extend()'s
-                # own docstring.
+                # branch's own `input_ids.size(0) > self.max_bs` eager
+                # fallback below). One plan() per round (not per layer),
+                # mirroring plan_decode()'s existing hoist -- see
+                # plan_mixed_extend()'s own docstring.
+                #
+                # pass_offload (2026-08-19, real-hardware finding via bm19):
+                # `num_rows > self.max_bs` added -- row count and token count
+                # are independent axes here (a verify row's own span can be
+                # wide with few rows, or many rows can each be narrow), and
+                # this path's graph buffers are row-capacity-fixed at
+                # self.max_bs regardless of total_tokens. Before this check,
+                # a round with LOW total_tokens but row count exceeding
+                # self.max_bs (e.g. branch-out-verify's checkpoint row riding
+                # alongside several other jobs' own rows) still took the
+                # graph-bucket branch below and crashed with a shape-mismatch
+                # RuntimeError on `graph_vars["qo_indptr"][:num_rows + 1] =
+                # context.cu_seqlens_q` -- see Config.max_graph_rows' own
+                # comment for the capacity-sizing question this doesn't
+                # answer (this check only prevents the crash; it does not
+                # keep the fast graph path available for a branch-heavy
+                # round -- that's a capacity-tuning question, not a
+                # correctness one).
                 plan_mixed_extend(
                     self._extend_wrapper, context.cu_seqlens_q, context.block_tables, context.context_lens,
                     self.block_size, **self._decode_plan_kwargs,
@@ -378,7 +397,6 @@ class ModelRunner:
                 graph = self.graphs_extend[bucket_t]
                 extend_wrapper = self.graph_extend_wrappers[bucket_t]
                 graph_vars = self.graph_extend_vars
-                num_rows = context.block_tables.size(0)
 
                 graph_vars["input_ids"][:total_tokens] = input_ids
                 graph_vars["positions"][:total_tokens] = positions
@@ -408,7 +426,18 @@ class ModelRunner:
             # verify_batch(), which already uses this identical bypass
             # today, being absorbed into this shared path).
             return F.linear(hidden, self.model.lm_head.weight)
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+        # pass_offload (2026-08-19): input_ids.size(0) compared against
+        # self.max_bs (the decode graph's own captured row-count ceiling),
+        # not a hardcoded 512 -- self.max_bs can be smaller than 512 (see
+        # Config.max_graph_rows), and the old hardcoded constant let a
+        # round's row count silently exceed what self.graphs' buckets were
+        # ever captured for (StopIteration from the bucket lookup below,
+        # same underlying class of bug the mixed-extend path's own
+        # `num_rows > self.max_bs` check above now also catches). Only
+        # reached when is_prefill is False (short-circuited by `or`
+        # otherwise), so input_ids.size(0) here really is this round's row
+        # count (1 token/row for a genuine decode call), not a token count.
+        if is_prefill or self.enforce_eager or input_ids.size(0) > self.max_bs:
             if not is_prefill:
                 # One plan() per decode step (not per layer -- see
                 # attention.py's plan_decode() docstring); every layer's
@@ -551,7 +580,19 @@ class ModelRunner:
     def capture_cudagraph(self):
         config = self.config
         hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
+        # pass_offload (2026-08-19, see Config.max_graph_rows' own comment):
+        # row capacity for BOTH graph families below (decode-only and mixed-
+        # extend) -- max_num_seqs is a job-admission concept, not a row-count
+        # one; only equal it by default for backward compatibility with
+        # every existing single-branch caller. Stashed on self.max_bs so
+        # run_model()'s own row-count fallback checks (below) reference the
+        # exact same captured ceiling these buffers were sized for, instead
+        # of a separately-maintained number that could drift out of sync.
+        max_bs = min(
+            config.max_graph_rows if config.max_graph_rows is not None else config.max_num_seqs,
+            512,
+        )
+        self.max_bs = max_bs
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
