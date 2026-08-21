@@ -10,7 +10,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.llama import LlamaForCausalLM
-from nanovllm.layers.attention import WORKSPACE_BYTES, plan_decode, plan_mixed_extend, plan_chunk_long, plan_chunk_short
+from nanovllm.layers.attention import WORKSPACE_BYTES, plan_decode, plan_mixed_extend
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -51,6 +51,13 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
+        # pass_offload/ADR-0036: attention's own paged-read granularity,
+        # decoupled from block_size (the real KV cache's allocation/I/O/
+        # prefix-hash unit -- see Config.kv_page_size's own comment). None
+        # (default) preserves page_size == block_size, i.e. today's ordinary
+        # paged attention, for every caller that doesn't set it.
+        self.page_size = config.kv_page_size or self.block_size
+        self.pages_per_block = self.block_size // self.page_size
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
@@ -158,22 +165,6 @@ class ModelRunner:
         self._extend_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
             torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device="cuda"), kv_layout="NHD",
         )
-        # pass_offload/ADR-0033 memory layout redesign: eager singletons for
-        # the two-level attention correctness fix (chunk-granularity
-        # extension storage packed into a shared physical block) -- same
-        # "built here, not lazily" convention as _decode_wrapper/
-        # _extend_wrapper above, one shared pair reused for both decode and
-        # mixed-extend rounds (decode is this mechanism's own qo_len=1
-        # degenerate case, mirroring plan_mixed_extend()'s own framing).
-        # Eager-path only for now (see run_model()'s own comment) --
-        # CUDA-graph bucketing for this mechanism is deliberately deferred
-        # to a future phase.
-        self._chunk_long_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-            torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device="cuda"), kv_layout="NHD",
-        )
-        self._chunk_short_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-            torch.empty(WORKSPACE_BYTES, dtype=torch.uint8, device="cuda"), kv_layout="NHD",
-        )
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
@@ -189,8 +180,22 @@ class ModelRunner:
         attn_module = None
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
+                # pass_offload/ADR-0036: each layer's own Attention module
+                # reads block_size back out of k_cache.shape[1] (see
+                # attention.py's _prefill()) -- handing it a page-granularity
+                # *view* here (aliases the same memory; .view() asserts
+                # contiguity rather than silently copying) makes every
+                # existing block_size-derived paged-read call site use
+                # page_size automatically, with no further change in
+                # attention.py beyond removing the now-unnecessary ChunkFix
+                # mechanism. self.kv_cache itself (this method's own
+                # variable, the shared (2, L, num_blocks, block_size, H, D)
+                # tensor) is deliberately NOT reshaped -- pass_offload's own
+                # proposer.py does raw block-granularity slice copies
+                # directly against it (commit-time promotion, fork prefix
+                # clone), independent of this per-layer read-side view.
+                module.k_cache = self.kv_cache[0, layer_id].view(-1, self.page_size, num_kv_heads, head_dim)
+                module.v_cache = self.kv_cache[1, layer_id].view(-1, self.page_size, num_kv_heads, head_dim)
                 attn_module = module
                 layer_id += 1
 
@@ -207,6 +212,27 @@ class ModelRunner:
             q_dtype=hf_config.dtype, kv_dtype=hf_config.dtype,
         )
 
+    def _expand_to_pages(self, block_table_row: list[int]) -> list[int]:
+        """pass_offload/ADR-0036: a real, physical block_table row (block
+        ids at self.block_size granularity, e.g. seq.block_table itself)
+        re-expressed as a virtual page row at self.page_size granularity --
+        each block id becomes self.pages_per_block consecutive page ids, in
+        order. page_id = block_id * pages_per_block + intra_block_page_index
+        is a pure re-numbering (no new allocation, no state) -- see
+        allocate_kv_cache()'s own comment for why this is exactly the
+        addressing a page-granularity k_cache/v_cache *view* expects.
+        `pass_offload`'s own overrides (DraftContextOverride/
+        VerifyContextOverride.block_row) arrive already expressed this way
+        (proposer.py builds them directly in page-id space) -- this helper
+        is only needed for a row's real, unmodified seq.block_table."""
+        if self.pages_per_block == 1:
+            return block_table_row
+        pages = []
+        for block_id in block_table_row:
+            base = block_id * self.pages_per_block
+            pages.extend(range(base, base + self.pages_per_block))
+        return pages
+
     def _block_table_row(self, seq: Sequence) -> list[int]:
         # pass_offload/ADR-0030: a seq drafting this round (see
         # prepare_decode()'s own comment) carries its own compacted,
@@ -217,11 +243,17 @@ class ModelRunner:
         # its own full block_table + extension blocks via
         # `_verify_context_override` -- checked first since a row is never
         # both drafting and verifying in the same round.
+        # pass_offload/ADR-0036: both overrides' own block_row is already
+        # expressed in page-id space (proposer.py builds it that way) -- only
+        # a row's real, unmodified seq.block_table (physical block ids) needs
+        # expanding here.
         verify_override = getattr(seq, "_verify_context_override", None)
         if verify_override is not None:
             return verify_override.block_row
         override = getattr(seq, "_draft_context_override", None)
-        return override.block_row if override is not None else seq.block_table
+        if override is not None:
+            return override.block_row
+        return self._expand_to_pages(seq.block_table)
 
     def _pad_rows_to_tensor(self, rows: list[list[int]]) -> torch.Tensor:
         max_len = max(len(row) for row in rows)
@@ -275,73 +307,6 @@ class ModelRunner:
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
-    def _build_chunk_fix_tensors(self, chunk_fixes, fallback_rows, fallback_context_lens, token_positions):
-        """pass_offload/ADR-0033 memory layout redesign: builds the tensors
-        plan_chunk_long()/plan_chunk_short()/Attention._apply_chunk_fix()
-        need, from each row's own ChunkFix (or None, meaning that row needs
-        no fix this round). chunk_fixes[i]/fallback_rows[i]/
-        fallback_context_lens[i]/token_positions[i] all align by row index;
-        token_positions[i] is the list of absolute position(s) row i
-        contributes to this round's flat batch, in append order -- used to
-        decide, per token, whether its own causal reach touches row i's
-        chunk (position >= chunk_fix.long_kv_len -- see Attention._apply_
-        chunk_fix()'s own docstring for the full correctness argument).
-        fallback_rows/fallback_context_lens are that row's own real, full
-        block_row/context_len, used for the long-region plan when the row
-        has no chunk fix -- never actually read in that case (chunk_mask is
-        False for all of its tokens), but must still be well-formed."""
-        chunk_mask = []
-        chunk_valid_lens = []
-        chunk_qo_lens = []
-        chunk_slot_mapping = []
-        long_block_tables_rows = []
-        long_context_lens = []
-        # Plain Python bool -- see Context.has_chunk_fix's own comment for
-        # why this must never be replaced by a `chunk_mask.any()` GPU-tensor
-        # check (real-hardware regression: forces a device-to-host sync,
-        # ruinous when checked once per transformer layer every round).
-        has_chunk_fix = any(cf is not None for cf in chunk_fixes)
-        for chunk_fix, row, context_len, positions in zip(
-            chunk_fixes, fallback_rows, fallback_context_lens, token_positions
-        ):
-            if chunk_fix is None:
-                chunk_mask.extend([False] * len(positions))
-                chunk_valid_lens.append(0)
-                chunk_qo_lens.append(0)
-                long_block_tables_rows.append(row)
-                long_context_lens.append(context_len)
-                continue
-            row_mask = [pos >= chunk_fix.long_kv_len for pos in positions]
-            chunk_mask.extend(row_mask)
-            chunk_valid_lens.append(chunk_fix.valid_len)
-            # Real-hardware regression (2026-08-19, see Attention._apply_
-            # chunk_fix()'s own docstring): the ragged chunk wrapper's own
-            # qo_len per row is how many of THIS row's positions are
-            # actually masked -- NOT chunk_fix.valid_len. For a decode/
-            # draft row (always exactly 1 position, masked as a whole
-            # whenever chunk_fix is present) these differ: qo_len=1 while
-            # valid_len can be up to CHUNK_SIZE. They only coincide for a
-            # verify/branch-out row's ragged multi-position span (masked
-            # positions are provably exactly that row's own trailing
-            # valid_len-sized sub-range).
-            chunk_qo_lens.append(sum(row_mask))
-            base = chunk_fix.block_id * self.block_size + chunk_fix.offset
-            chunk_slot_mapping.extend(range(base, base + chunk_fix.valid_len))
-            long_block_tables_rows.append(chunk_fix.long_block_row)
-            long_context_lens.append(chunk_fix.long_kv_len)
-
-        chunk_mask = torch.tensor(chunk_mask, dtype=torch.bool, pin_memory=True).cuda(non_blocking=True)
-        chunk_kv_indptr = torch.zeros(len(chunk_valid_lens) + 1, dtype=torch.int32)
-        chunk_kv_indptr[1:] = torch.tensor(chunk_valid_lens, dtype=torch.int32).cumsum(dim=0)
-        chunk_kv_indptr = chunk_kv_indptr.pin_memory().cuda(non_blocking=True)
-        chunk_qo_indptr = torch.zeros(len(chunk_qo_lens) + 1, dtype=torch.int32)
-        chunk_qo_indptr[1:] = torch.tensor(chunk_qo_lens, dtype=torch.int32).cumsum(dim=0)
-        chunk_qo_indptr = chunk_qo_indptr.pin_memory().cuda(non_blocking=True)
-        chunk_slot_mapping = torch.tensor(chunk_slot_mapping, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        long_block_tables = self._pad_rows_to_tensor(long_block_tables_rows)
-        long_context_lens = torch.tensor(long_context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        return chunk_mask, chunk_slot_mapping, long_block_tables, long_context_lens, chunk_kv_indptr, chunk_qo_indptr, has_chunk_fix
-
     def prepare_decode(self, seqs: list[Sequence]):
         # pass_offload/ADR-0030: a seq may carry a `_draft_context_override`
         # (input_token/position/slot/context_len/block_row) for this one
@@ -357,8 +322,6 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
-        chunk_fixes = []
-        fallback_rows = []
         for seq in seqs:
             override = getattr(seq, "_draft_context_override", None)
             if override is None:
@@ -366,36 +329,17 @@ class ModelRunner:
                 positions.append(len(seq) - 1)
                 context_lens.append(len(seq))
                 slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
-                chunk_fixes.append(None)
-                fallback_rows.append(seq.block_table)
             else:
                 input_ids.append(override.input_token)
                 positions.append(override.position)
                 context_lens.append(override.context_len)
                 slot_mapping.append(override.slot)
-                chunk_fixes.append(override.chunk_fix)
-                fallback_rows.append(override.block_row)
-        chunk_mask, chunk_slot_mapping, chunk_long_block_tables, chunk_long_context_lens, chunk_kv_indptr, chunk_qo_indptr, has_chunk_fix = (
-            self._build_chunk_fix_tensors(chunk_fixes, fallback_rows, context_lens, [[p] for p in positions])
-        )
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        # ADR-0033 memory layout redesign: cu_seqlens_q was previously never
-        # populated during decode (nothing read it) -- plan_chunk_long()/
-        # plan_chunk_short() need a qo_indptr, and decode's is simply
-        # arange(num_rows+1) (query_len=1 per row). Confirmed safe to start
-        # populating: embed_head.py's own cu_seqlens_q read is prefill-only
-        # (is_prefill=True), and nothing else touches it during decode.
-        cu_seqlens_q = torch.arange(len(seqs) + 1, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(
-            False, cu_seqlens_q=cu_seqlens_q, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables,
-            chunk_mask=chunk_mask, chunk_slot_mapping=chunk_slot_mapping, has_chunk_fix=has_chunk_fix,
-            chunk_long_block_tables=chunk_long_block_tables, chunk_long_context_lens=chunk_long_context_lens,
-            chunk_kv_indptr=chunk_kv_indptr, chunk_qo_indptr=chunk_qo_indptr,
-        )
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
     def prepare_mixed_extend(self, seqs: list[Sequence]):
@@ -418,9 +362,6 @@ class ModelRunner:
         slot_mapping = []
         cu_seqlens_q = [0]
         context_lens = []
-        chunk_fixes = []
-        fallback_rows = []
-        token_positions = []
         for seq in seqs:
             verify = getattr(seq, "_verify_context_override", None)
             if verify is not None:
@@ -429,9 +370,6 @@ class ModelRunner:
                 slot_mapping.extend(verify.slot_mapping)
                 cu_seqlens_q.append(cu_seqlens_q[-1] + len(verify.input_tokens))
                 context_lens.append(verify.num_cached_tokens + len(verify.input_tokens))
-                chunk_fixes.append(verify.chunk_fix)
-                fallback_rows.append(verify.block_row)
-                token_positions.append(list(verify.positions))
                 continue
             draft = getattr(seq, "_draft_context_override", None)
             if draft is not None:
@@ -439,33 +377,19 @@ class ModelRunner:
                 positions.append(draft.position)
                 slot_mapping.append(draft.slot)
                 context_lens.append(draft.context_len)
-                chunk_fixes.append(draft.chunk_fix)
-                fallback_rows.append(draft.block_row)
-                token_positions.append([draft.position])
             else:
                 input_ids.append(seq.last_token)
                 positions.append(len(seq) - 1)
                 slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
                 context_lens.append(len(seq))
-                chunk_fixes.append(None)
-                fallback_rows.append(seq.block_table)
-                token_positions.append([len(seq) - 1])
             cu_seqlens_q.append(cu_seqlens_q[-1] + 1)
-        chunk_mask, chunk_slot_mapping, chunk_long_block_tables, chunk_long_context_lens, chunk_kv_indptr, chunk_qo_indptr, has_chunk_fix = (
-            self._build_chunk_fix_tensors(chunk_fixes, fallback_rows, context_lens, token_positions)
-        )
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(
-            True, cu_seqlens_q=cu_seqlens_q, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables,
-            chunk_mask=chunk_mask, chunk_slot_mapping=chunk_slot_mapping, has_chunk_fix=has_chunk_fix,
-            chunk_long_block_tables=chunk_long_block_tables, chunk_long_context_lens=chunk_long_context_lens,
-            chunk_kv_indptr=chunk_kv_indptr, chunk_qo_indptr=chunk_qo_indptr,
-        )
+        set_context(True, cu_seqlens_q=cu_seqlens_q, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -479,7 +403,7 @@ class ModelRunner:
             context = get_context()
             total_tokens = input_ids.size(0)
             num_rows = context.block_tables.size(0)
-            if self.enforce_eager or total_tokens > self.graph_extend_tokens[-1] or num_rows > self.max_bs:
+            if self.enforce_eager or total_tokens > self.graph_extend_tokens[-1] or num_rows > self.graph_extend_rows[-1]:
                 # pass_offload/ADR-0031: eager fallback -- enforce_eager, or a
                 # round whose total flattened query-token count exceeds even
                 # this path's largest captured bucket (mirrors the decode
@@ -489,78 +413,49 @@ class ModelRunner:
                 # plan_mixed_extend()'s own docstring.
                 #
                 # pass_offload (2026-08-19, real-hardware finding via bm19):
-                # `num_rows > self.max_bs` added -- row count and token count
+                # `num_rows > ...` added -- row count and token count
                 # are independent axes here (a verify row's own span can be
                 # wide with few rows, or many rows can each be narrow), and
-                # this path's graph buffers are row-capacity-fixed at
-                # self.max_bs regardless of total_tokens. Before this check,
-                # a round with LOW total_tokens but row count exceeding
-                # self.max_bs (e.g. branch-out-verify's checkpoint row riding
-                # alongside several other jobs' own rows) still took the
-                # graph-bucket branch below and crashed with a shape-mismatch
-                # RuntimeError on `graph_vars["qo_indptr"][:num_rows + 1] =
-                # context.cu_seqlens_q` -- see Config.max_graph_rows' own
-                # comment for the capacity-sizing question this doesn't
-                # answer (this check only prevents the crash; it does not
-                # keep the fast graph path available for a branch-heavy
-                # round -- that's a capacity-tuning question, not a
-                # correctness one).
+                # this path's graph buffers used to be row-capacity-fixed at
+                # a single self.max_bs regardless of total_tokens. Before
+                # this check existed, a round with LOW total_tokens but row
+                # count exceeding that fixed ceiling (e.g. branch-out-verify's
+                # checkpoint row riding alongside several other jobs' own
+                # rows) still took the graph-bucket branch below and crashed
+                # with a shape-mismatch RuntimeError on
+                # `graph_vars["qo_indptr"][:num_rows + 1] =
+                # context.cu_seqlens_q`.
+                #
+                # pass_offload (2026-08-20, direction 3, see
+                # Config.max_extend_rows' own comment): the ceiling is now
+                # `self.graph_extend_rows[-1]` (this path's own, separately
+                # bucketed row-count ladder), not `self.max_bs` -- a
+                # branch-heavy round whose row count exceeds `max_bs` but not
+                # this wider ceiling now replays a captured graph (sized to
+                # whichever row bucket fits) instead of falling here. This
+                # eager path remains the true overflow-of-last-resort: reached
+                # only when row count exceeds even the widest captured row
+                # bucket, or the token count exceeds the widest token bucket,
+                # or enforce_eager was requested outright.
                 plan_mixed_extend(
                     self._extend_wrapper, context.cu_seqlens_q, context.block_tables, context.context_lens,
-                    self.block_size, **self._decode_plan_kwargs,
+                    self.page_size, **self._decode_plan_kwargs,
                 )
                 context.extend_wrapper = self._extend_wrapper
-                # ADR-0033 memory layout redesign: two-level attention fix,
-                # eager path only (see class docstring in attention.py's
-                # Attention._apply_chunk_fix() for the full correctness
-                # argument) -- planned only when at least one row actually
-                # needs it this round. Gated on context.has_chunk_fix (a
-                # plain Python bool computed on the CPU side), never
-                # `chunk_mask.any()` -- that forces a device-to-host sync on
-                # a CUDA tensor (real-hardware regression, 2026-08-19).
-                if context.has_chunk_fix:
-                    plan_chunk_long(
-                        self._chunk_long_wrapper, context.cu_seqlens_q, context.chunk_long_block_tables,
-                        context.chunk_long_context_lens, self.block_size, **self._decode_plan_kwargs,
-                    )
-                    # qo_indptr is chunk_qo_indptr (masked-position count per
-                    # row), NOT context.cu_seqlens_q (the row's full span) --
-                    # the ragged causal wrapper only ever sees the masked
-                    # query positions (Attention._apply_chunk_fix() gathers q
-                    # down to context.chunk_mask before calling .run()).
-                    # chunk_qo_indptr != chunk_kv_indptr in general (a
-                    # decode/draft row has exactly 1 masked query position
-                    # but can have up to CHUNK_SIZE valid chunk KV tokens) --
-                    # real-hardware regression, 2026-08-19, see that
-                    # method's own docstring.
-                    plan_chunk_short(
-                        self._chunk_short_wrapper, context.chunk_qo_indptr, context.chunk_kv_indptr,
-                        **self._decode_plan_kwargs,
-                    )
-                    context.chunk_long_wrapper = self._chunk_long_wrapper
-                    context.chunk_short_wrapper = self._chunk_short_wrapper
                 hidden = self.model(input_ids, positions)
             else:
-                # ADR-0033 memory layout redesign: the two-level attention
-                # fix's CUDA-graph bucketing is deliberately deferred to a
-                # future phase (see ADR's own staging note) -- fail loud
-                # here rather than silently crash on chunk_long_wrapper
-                # being None inside Attention._apply_chunk_fix().
-                assert not context.has_chunk_fix, (
-                    "two-level attention chunk fix not yet supported under "
-                    "CUDA graph capture (enforce_eager=False) -- ADR-0033 "
-                    "memory layout redesign, deferred to a future phase"
-                )
                 # pass_offload/ADR-0031 follow-up: CUDA-graph bucketed by
-                # total flattened query-token count, not row count (a verify
-                # row's own N has no fixed ceiling the way row count does --
-                # ADR-0031 decision 5). Row count is fixed at this path's own
-                # `max_bs` (capture_cudagraph()) across every bucket; real
-                # rows (this round's own seqs order) come first, padding rows
-                # after get zero query length + zero KV context.
+                # total flattened query-token count (a verify row's own N has
+                # no fixed ceiling the way row count does -- ADR-0031
+                # decision 5) AND, since 2026-08-20 (direction 3), by row
+                # count too -- real rows (this round's own seqs order) come
+                # first, padding rows after get zero query length + zero KV
+                # context, same as before; the only change is which
+                # (row_bucket, token_bucket) graph/wrapper pair gets picked.
+                bucket_r = next(x for x in self.graph_extend_rows if x >= num_rows)
                 bucket_t = next(x for x in self.graph_extend_tokens if x >= total_tokens)
-                graph = self.graphs_extend[bucket_t]
-                extend_wrapper = self.graph_extend_wrappers[bucket_t]
+                graph = self.graphs_extend[(bucket_r, bucket_t)]
+                extend_wrapper = self.graph_extend_wrappers[(bucket_r, bucket_t)]
                 graph_vars = self.graph_extend_vars
 
                 graph_vars["input_ids"][:total_tokens] = input_ids
@@ -577,9 +472,13 @@ class ModelRunner:
                 graph_vars["context_lens"][:num_rows] = context.context_lens
                 graph_vars["block_tables"].fill_(-1)
                 graph_vars["block_tables"][:num_rows, :context.block_tables.size(1)] = context.block_tables
+                # Sliced to :bucket_r (not the full, max_extend_bs-wide
+                # graph_vars) -- this graph/wrapper's own FlashInfer-fixed
+                # row capacity is bucket_r, mirroring the decode branch's own
+                # `graph_vars["block_tables"][:bucket_bs]` slicing below.
                 plan_mixed_extend(
-                    extend_wrapper, graph_vars["qo_indptr"], graph_vars["block_tables"], graph_vars["context_lens"],
-                    self.block_size, **self._decode_plan_kwargs,
+                    extend_wrapper, graph_vars["qo_indptr"][: bucket_r + 1], graph_vars["block_tables"][:bucket_r],
+                    graph_vars["context_lens"][:bucket_r], self.page_size, **self._decode_plan_kwargs,
                 )
                 context.extend_wrapper = extend_wrapper
                 graph.replay()
@@ -611,44 +510,13 @@ class ModelRunner:
                 context = get_context()
                 plan_decode(
                     self._decode_wrapper, context.block_tables, context.context_lens,
-                    self.block_size, **self._decode_plan_kwargs,
+                    self.page_size, **self._decode_plan_kwargs,
                 )
                 context.decode_wrapper = self._decode_wrapper
-                # ADR-0033 memory layout redesign: same eager-only two-level
-                # attention fix as the mixed-extend branch above.
-                if context.has_chunk_fix:
-                    plan_chunk_long(
-                        self._chunk_long_wrapper, context.cu_seqlens_q, context.chunk_long_block_tables,
-                        context.chunk_long_context_lens, self.block_size, **self._decode_plan_kwargs,
-                    )
-                    # qo_indptr is chunk_qo_indptr (masked-position count per
-                    # row), NOT context.cu_seqlens_q (the row's full span) --
-                    # the ragged causal wrapper only ever sees the masked
-                    # query positions (Attention._apply_chunk_fix() gathers q
-                    # down to context.chunk_mask before calling .run()).
-                    # chunk_qo_indptr != chunk_kv_indptr in general (a
-                    # decode/draft row has exactly 1 masked query position
-                    # but can have up to CHUNK_SIZE valid chunk KV tokens) --
-                    # real-hardware regression, 2026-08-19, see that
-                    # method's own docstring.
-                    plan_chunk_short(
-                        self._chunk_short_wrapper, context.chunk_qo_indptr, context.chunk_kv_indptr,
-                        **self._decode_plan_kwargs,
-                    )
-                    context.chunk_long_wrapper = self._chunk_long_wrapper
-                    context.chunk_short_wrapper = self._chunk_short_wrapper
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
             bs = input_ids.size(0)
             context = get_context()
-            # ADR-0033 memory layout redesign: CUDA-graph bucketing for the
-            # two-level attention fix is deliberately deferred -- fail loud
-            # rather than silently crash on chunk_long_wrapper being None.
-            assert not context.has_chunk_fix, (
-                "two-level attention chunk fix not yet supported under "
-                "CUDA graph capture (enforce_eager=False) -- ADR-0033 "
-                "memory layout redesign, deferred to a future phase"
-            )
             bucket_bs = next(x for x in self.graph_bs if x >= bs)
             graph = self.graphs[bucket_bs]
             decode_wrapper = self.graph_decode_wrappers[bucket_bs]
@@ -673,7 +541,7 @@ class ModelRunner:
             # the wrapper's own FlashInfer-fixed batch size is bucket_bs.
             plan_decode(
                 decode_wrapper, graph_vars["block_tables"][:bucket_bs], graph_vars["context_lens"][:bucket_bs],
-                self.block_size, **self._decode_plan_kwargs,
+                self.page_size, **self._decode_plan_kwargs,
             )
             context.decode_wrapper = decode_wrapper
             graph.replay()
@@ -789,7 +657,15 @@ class ModelRunner:
             512,
         )
         self.max_bs = max_bs
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        # pass_offload/ADR-0036: sized at page_size granularity (not
+        # block_size) -- every block/chunk address fed to FlashInfer's
+        # paged wrappers is now a page id, so the block_tables/indices
+        # buffers below must have room for pages_per_block times as many
+        # entries per row. Negligible in absolute terms at this project's
+        # own config (see ADR-0036's own memory calculation) -- a few
+        # hundred KiB, not a meaningful fraction of the 128MB-per-wrapper
+        # workspace buffers already allocated above.
+        max_num_blocks = (config.max_model_len + self.page_size - 1) // self.page_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
@@ -850,7 +726,7 @@ class ModelRunner:
             # both the warmup and capture forward passes below, which reuse
             # this same planned state (identical dummy data either way, so
             # nothing needs re-planning between them).
-            plan_decode(decode_wrapper, block_tables[:bs], context_lens[:bs], self.block_size, **self._decode_plan_kwargs)
+            plan_decode(decode_wrapper, block_tables[:bs], context_lens[:bs], self.page_size, **self._decode_plan_kwargs)
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
@@ -863,20 +739,57 @@ class ModelRunner:
         # pass_offload/ADR-0031 follow-up: CUDA-graph buckets for the mixed
         # decode+draft+verify extend path, bucketed by total flattened
         # query-token count (a verify row's own N has no fixed ceiling the
-        # way row count does -- ADR-0031 decision 5), not row count. Row
-        # count is fixed at `max_bs` across every one of these buckets (same
-        # value decode's own buckets use above); only the token-width
-        # buffers vary per bucket. `max_bs * 8` is a deliberately modest
-        # ceiling, not `config.max_num_batched_tokens` directly -- a real
-        # round's total tokens is `max_bs` decode/draft rows (1 token each)
-        # plus a typically-small verify window, not a full-batch prefill
-        # flood; capping the ladder there keeps bucket count (and this
-        # one-time capture cost, one forward pass per bucket) in the same
-        # order of magnitude as decode's own ladder above, instead of
+        # way row count does -- ADR-0031 decision 5). `max_bs * 8` is a
+        # deliberately modest ceiling, not `config.max_num_batched_tokens`
+        # directly -- a real round's total tokens is roughly this path's own
+        # row capacity worth of decode/draft rows (1 token each) plus a
+        # typically-small verify window, not a full-batch prefill flood;
+        # capping the ladder there keeps bucket count (and this one-time
+        # capture cost, one forward pass per bucket) in the same order of
+        # magnitude as decode's own ladder above, instead of
         # `range(16, 16384, 16)`'s ~1000 buckets. Still bounded above by
         # config's own hard cap; anything past this ceiling falls back to
         # the existing eager path in run_model(), same safety net decode's
         # own `input_ids.size(0) > 512` fallback already relies on.
+        #
+        # pass_offload (2026-08-20, direction 3, see Config.max_extend_rows'
+        # own comment): row count is now ALSO bucketed here (previously
+        # fixed at `max_bs` across every token bucket). Deliberately a
+        # MINIMAL two-point ladder -- {max_bs, max_extend_bs} -- not the full
+        # log/linear `_bucket_ladder()` shape decode's own row buckets use.
+        # Real-hardware finding (2026-08-20): a first version used
+        # `_bucket_ladder(max_extend_bs)` for this, which (a) even with
+        # `config.max_extend_rows` left at its default None default
+        # (max_extend_bs == max_bs) still produces `[1, 2, 4, 8]` for
+        # max_bs=8 -- FOUR row buckets, not the single fixed-max_bs shape
+        # this path always used before this change, silently 4x'ing every
+        # EXISTING caller's own mixed-extend graph count/capture time even
+        # when they never opted into anything; and (b) when actually opted
+        # in (max_extend_bs=16), produced 5 row buckets which, crossed with
+        # the token ladder, was enough extra graph-capture memory to tip this
+        # Jetson's already-tight post-KV-cache headroom into a genuine
+        # `NvMapMemAllocInternalTagged` OOM on the very next real workload.
+        # `sorted({max_bs, max_extend_bs})` fixes both: collapses to exactly
+        # `[max_bs]` (one bucket, bit-for-bit the original behavior, zero
+        # capture-time change) when `max_extend_rows` is unset -- and even
+        # when explicitly widened, adds exactly one more row bucket (not
+        # four), since branch-out verify's own overflow rows only need
+        # somewhere to land, not a finely-graduated ladder down to 1 (that
+        # granularity matters for ordinary decode, which already always pads
+        # to max_bs regardless -- this path's own pre-existing behavior,
+        # unchanged here).
+        max_extend_bs = min(
+            config.max_extend_rows if config.max_extend_rows is not None else max_bs,
+            512,
+        )
+        self.graph_extend_rows = sorted({max_bs, max_extend_bs})
+        # Tied to `max_bs`, not `max_extend_bs` -- branch-out verify's own
+        # extra checkpoint/fork rows are typically narrow (a handful of
+        # tokens each, per ADR-0033's own "never more than ~20 tokens
+        # accumulate" empirical figure), so widening row capacity for them
+        # doesn't call for a wider token ceiling too; keeping this tied to
+        # max_bs holds the token ladder at its original length regardless of
+        # max_extend_rows.
         extend_ceiling = min(config.max_num_batched_tokens, max_bs * 8)
         self.graph_extend_tokens = _bucket_ladder(extend_ceiling)
         self.graphs_extend = {}
@@ -887,61 +800,68 @@ class ModelRunner:
         extend_positions = torch.zeros(extend_ceiling, dtype=torch.int64)
         extend_slot_mapping = torch.zeros(extend_ceiling, dtype=torch.int32)
         extend_outputs = torch.zeros(extend_ceiling, hf_config.hidden_size)
-        extend_qo_indptr = torch.zeros(max_bs + 1, dtype=torch.int32, device="cuda")
+        # Row-dim buffers sized to `max_extend_bs` (was `max_bs`) -- one
+        # shared tensor per field, sliced to `[:r]`/`[:r + 1]` per row bucket
+        # `r` below, same "one wide buffer, sliced per bucket" pattern
+        # decode's own `block_tables`/`context_lens` already use above.
+        extend_qo_indptr = torch.zeros(max_extend_bs + 1, dtype=torch.int32, device="cuda")
         # Separate from decode's own context_lens/block_tables above (not
         # reused) -- keeps each graph family's buffer ownership unambiguous,
         # even though decode never runs concurrently with this path.
-        extend_context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        extend_block_tables = torch.full((max_bs, max_num_blocks), -1, dtype=torch.int32)
+        extend_context_lens = torch.zeros(max_extend_bs, dtype=torch.int32)
+        extend_block_tables = torch.full((max_extend_bs, max_num_blocks), -1, dtype=torch.int32)
 
-        for t in reversed(self.graph_extend_tokens):
-            qo_indptr_buf = torch.zeros(max_bs + 1, dtype=torch.int32, device="cuda")
-            kv_indptr_buf = torch.zeros(max_bs + 1, dtype=torch.int32, device="cuda")
-            kv_indices_buf = torch.zeros(max_bs * max_num_blocks, dtype=torch.int32, device="cuda")
-            kv_last_page_len_buf = torch.zeros(max_bs, dtype=torch.int32, device="cuda")
-            extend_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-                extend_workspace_buffer, kv_layout="NHD", use_cuda_graph=True,
-                qo_indptr_buf=qo_indptr_buf, paged_kv_indptr_buf=kv_indptr_buf,
-                paged_kv_indices_buf=kv_indices_buf, paged_kv_last_page_len_buf=kv_last_page_len_buf,
-            )
-            self.graph_extend_wrappers[t] = extend_wrapper
+        for r in reversed(self.graph_extend_rows):
+            for t in reversed(self.graph_extend_tokens):
+                qo_indptr_buf = torch.zeros(r + 1, dtype=torch.int32, device="cuda")
+                kv_indptr_buf = torch.zeros(r + 1, dtype=torch.int32, device="cuda")
+                kv_indices_buf = torch.zeros(r * max_num_blocks, dtype=torch.int32, device="cuda")
+                kv_last_page_len_buf = torch.zeros(r, dtype=torch.int32, device="cuda")
+                extend_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+                    extend_workspace_buffer, kv_layout="NHD", use_cuda_graph=True,
+                    qo_indptr_buf=qo_indptr_buf, paged_kv_indptr_buf=kv_indptr_buf,
+                    paged_kv_indices_buf=kv_indices_buf, paged_kv_last_page_len_buf=kv_last_page_len_buf,
+                )
+                self.graph_extend_wrappers[(r, t)] = extend_wrapper
 
-            # Dummy capture data: row 0 alone carries the whole bucket's
-            # query-token capacity `t` (qo_indptr flat at `t` for every
-            # other row -- zero query length), with a real, valid block
-            # range so plan()'s indices stay self-consistent with its own
-            # indptr. This fixes FlashInfer's `_max_total_num_rows` at `t`
-            # for this wrapper's whole lifetime (confirmed via a real-
-            # hardware probe, see docs/adr/0031...); later real plan()
-            # calls may use any total <= t. Every other row is genuinely
-            # zero-context (last_page_len=0, block row all -1), exercising
-            # the same padding shape run_model()'s graph branch uses below.
-            n_blocks = (t + self.block_size - 1) // self.block_size
-            extend_context_lens.zero_()
-            extend_context_lens[0] = t
-            extend_block_tables.fill_(-1)
-            extend_block_tables[0, :n_blocks] = torch.arange(n_blocks, dtype=torch.int32, device="cuda")
-            extend_qo_indptr.fill_(t)
-            extend_qo_indptr[0] = 0
+                # Dummy capture data: row 0 alone carries the whole bucket's
+                # query-token capacity `t` (qo_indptr flat at `t` for every
+                # other row -- zero query length), with a real, valid block
+                # range so plan()'s indices stay self-consistent with its own
+                # indptr. This fixes FlashInfer's `_max_total_num_rows` at
+                # `t` for this wrapper's whole lifetime (confirmed via a
+                # real-hardware probe, see docs/adr/0031...); later real
+                # plan() calls may use any total <= t. Every other row (up to
+                # this bucket's own row capacity `r`, not always `max_bs` --
+                # 2026-08-20) is genuinely zero-context (last_page_len=0,
+                # block row all -1), exercising the same padding shape
+                # run_model()'s graph branch uses below.
+                n_blocks = (t + self.page_size - 1) // self.page_size
+                extend_context_lens[:r].zero_()
+                extend_context_lens[0] = t
+                extend_block_tables[:r].fill_(-1)
+                extend_block_tables[0, :n_blocks] = torch.arange(n_blocks, dtype=torch.int32, device="cuda")
+                extend_qo_indptr[: r + 1].fill_(t)
+                extend_qo_indptr[0] = 0
 
-            graph = torch.cuda.CUDAGraph()
-            set_context(
-                True, cu_seqlens_q=extend_qo_indptr, slot_mapping=extend_slot_mapping[:t],
-                context_lens=extend_context_lens, block_tables=extend_block_tables,
-                extend_wrapper=extend_wrapper,
-            )
-            plan_mixed_extend(
-                extend_wrapper, extend_qo_indptr, extend_block_tables, extend_context_lens,
-                self.block_size, **self._decode_plan_kwargs,
-            )
-            extend_outputs[:t] = self.model(extend_input_ids[:t], extend_positions[:t])    # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
-                extend_outputs[:t] = self.model(extend_input_ids[:t], extend_positions[:t])    # capture
-            if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-            self.graphs_extend[t] = graph
-            torch.cuda.synchronize()
-            reset_context()
+                graph = torch.cuda.CUDAGraph()
+                set_context(
+                    True, cu_seqlens_q=extend_qo_indptr[: r + 1], slot_mapping=extend_slot_mapping[:t],
+                    context_lens=extend_context_lens[:r], block_tables=extend_block_tables[:r],
+                    extend_wrapper=extend_wrapper,
+                )
+                plan_mixed_extend(
+                    extend_wrapper, extend_qo_indptr[: r + 1], extend_block_tables[:r], extend_context_lens[:r],
+                    self.page_size, **self._decode_plan_kwargs,
+                )
+                extend_outputs[:t] = self.model(extend_input_ids[:t], extend_positions[:t])    # warmup
+                with torch.cuda.graph(graph, self.graph_pool):
+                    extend_outputs[:t] = self.model(extend_input_ids[:t], extend_positions[:t])    # capture
+                if self.graph_pool is None:
+                    self.graph_pool = graph.pool()
+                self.graphs_extend[(r, t)] = graph
+                torch.cuda.synchronize()
+                reset_context()
 
         self.graph_extend_vars = dict(
             input_ids=extend_input_ids,
