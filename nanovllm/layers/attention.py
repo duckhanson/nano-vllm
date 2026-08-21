@@ -81,7 +81,24 @@ def _paged_kv_meta(block_tables: torch.Tensor, kv_lens: torch.Tensor, block_size
     # to >= 0 fixes the zero-context case without changing any nonzero-row
     # result (verified: for num_pages >= 1 this clamp is a no-op).
     last_page_len = (kv_lens - torch.clamp(num_pages - 1, min=0) * block_size).to(torch.int32)
-    indices = block_tables[block_tables >= 0].to(torch.int32)
+    # pass_offload/ADR-0036 amendment 4: NOT `block_tables[block_tables >= 0]`
+    # -- that blanket flatten assumed every row's own count of non-negative
+    # entries exactly equals that row's own num_pages, which only held
+    # pre-ADR-0036 (one physical block == one page, so a block's own fill
+    # level never affected page COUNT). `_expand_to_pages()`/proposer.py's
+    # `_block_to_page_ids()` always emit a block's full page_size-derived
+    # page count regardless of how filled that block really is, so a row
+    # whose real content doesn't happen to fill its last block to within one
+    # page-width contributes MORE non-negative entries than its own
+    # num_pages -- silently shifting every later row's slice onto an
+    # earlier row's own left-over pages (confirmed via real-hardware
+    # Prediction 4 divergence, ADR-0036 amendment 4). Fix: take each row's
+    # own first num_pages[i] columns explicitly, in row-major order --
+    # correct regardless of how many extra (real or -1) entries trail
+    # after that in the same row.
+    col_idx = torch.arange(block_tables.size(1), device=block_tables.device)
+    row_mask = col_idx.unsqueeze(0) < num_pages.unsqueeze(1)
+    indices = block_tables[row_mask].to(torch.int32)
     return indptr, indices, last_page_len
 
 
