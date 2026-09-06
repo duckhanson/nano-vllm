@@ -665,7 +665,7 @@ class ModelRunner:
         # own config (see ADR-0036's own memory calculation) -- a few
         # hundred KiB, not a meaningful fraction of the 128MB-per-wrapper
         # workspace buffers already allocated above.
-        max_num_blocks = (config.max_model_len + self.page_size - 1) // self.page_size
+        max_num_blocks = (config.max_model_len + self.page_size - 1) // self.page_size + config.max_graph_extension_blocks
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)

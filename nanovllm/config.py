@@ -58,6 +58,23 @@ class Config:
     # property to hold, so the two concerns share this single value by
     # construction, not by convention.
     kv_page_size: int | None = None
+    # pass_offload (2026-09-06, bm49/ticket 63): CUDA-graph block_tables
+    # capacity (both decode and mixed-extend families -- capture_cudagraph()'s
+    # own max_num_blocks is shared by both) is derived purely from
+    # max_model_len, with no headroom for pass_offload's own extension
+    # chunk -- a page-id column appended to a branch's block_row on top of
+    # its real context once that branch has committed draft content awaiting
+    # verification (FlashInferProposer's own `extension_block_table`, ADR-0033
+    # decision 3: at most ONE such chunk per branch, ever -- "fail loud, not
+    # a second chunk"). Every real verify()/fan_in_batch() call carries this
+    # extra column, so replaying a captured graph for those calls without
+    # this headroom fails with a block_tables width mismatch (discovered via
+    # bm49's own real-hardware pilot, not a hypothetical). 0 (default)
+    # preserves the exact previous behavior for every caller that doesn't
+    # set it; pass_offload sets this to 1 (its own one-chunk-per-branch
+    # invariant), never derived automatically, since nano-vLLM itself has no
+    # notion of "extension chunk."
+    max_graph_extension_blocks: int = 0
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
