@@ -29,3 +29,6 @@ def load_model(model: nn.Module, path: str):
                     param = model.get_parameter(weight_name)
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, f.get_tensor(weight_name))
+    for module in model.modules():
+        if hasattr(module, "process_weights_after_loading"):
+            module.process_weights_after_loading()
