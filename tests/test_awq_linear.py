@@ -52,7 +52,7 @@ def _load(layer, shards):
 
 
 def _check(layer, w, k):
-    for m in (4, 64):  # Triton kernel path and dequantize path.
+    for m in (4, 64, 2048):  # Triton kernel, its 32-row chunks, and the dequantize path.
         x = torch.randn(m, k, device="cuda", dtype=torch.float16)
         ref = x.float() @ w.t()
         out = layer(x)
@@ -97,3 +97,16 @@ def test_row_awq(fp16_cuda_default):
     _load(layer, {None: tensors})
     _check(layer, w, k)
     assert not hasattr(layer, "qweight")  # Raw AWQ tensors are freed after repacking.
+
+
+def test_rows_past_32_run_the_int4_kernel_in_32_row_chunks(fp16_cuda_default):
+    """Verify with a tree (up to ~128 rows) must not fall to the per-call dequantize path (65 ms per layer)."""
+    k, n = 1024, 256
+    layer = linear.RowParallelLinear(k, n, quantized=True)
+    tensors, _ = _random_awq(k, n)
+    _load(layer, {None: tensors})
+    x = torch.randn(128, k, device="cuda", dtype=torch.float16)
+    out = layer(x)
+    for i in range(0, 128, 32):
+        assert torch.equal(out[i:i + 32], layer(x[i:i + 32]))
+    assert linear.CHUNKED_INT4_MAX_ROWS >= 128

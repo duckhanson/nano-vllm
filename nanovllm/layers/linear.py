@@ -5,6 +5,10 @@ import torch.distributed as dist
 
 from nanovllm.layers import int4_triton
 
+# Up to here, 32-row INT4 kernel calls beat dequantizing the whole layer each call (63 ms per layer on
+# the Orin; they cross near 1400 rows, tree_verify 2026-10-13); prefill's thousands of rows dequantize.
+CHUNKED_INT4_MAX_ROWS = 1024
+
 
 def divide(numerator, denominator):
     assert numerator % denominator == 0
@@ -75,6 +79,8 @@ class LinearBase(nn.Module):
         x2 = x.reshape(-1, x.size(-1))
         if x2.size(0) <= 32:
             y = int4_triton.matmul(x2, self.int4)
+        elif x2.size(0) <= CHUNKED_INT4_MAX_ROWS:
+            y = torch.cat([int4_triton.matmul(x2[i:i + 32], self.int4) for i in range(0, x2.size(0), 32)])
         else:
             y = x2 @ int4_triton.dequantize(self.int4)
         if bias is not None:
