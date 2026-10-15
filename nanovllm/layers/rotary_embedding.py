@@ -24,6 +24,35 @@ def _llama3_inv_freq(inv_freq: torch.Tensor, rope_scaling: dict) -> torch.Tensor
     return torch.where(is_medium_freq, smoothed_inv_freq, inv_freq_llama)
 
 
+def _yarn_inv_freq(inv_freq: torch.Tensor, rope_scaling: dict, base: float) -> tuple[torch.Tensor, float]:
+    """YaRN's frequencies and attention factor (Qwen3's long-context setting).
+    Mirrors transformers.modeling_rope_utils._compute_yarn_parameters for the
+    keys Qwen3 uses; the attention factor scales cos and sin."""
+    for key in ("attention_factor", "mscale", "mscale_all_dim"):
+        if rope_scaling.get(key) is not None:
+            raise NotImplementedError(f"YaRN {key} is not supported")
+    factor = rope_scaling["factor"]
+    old_context_len = rope_scaling["original_max_position_embeddings"]
+    beta_fast = rope_scaling.get("beta_fast") or 32
+    beta_slow = rope_scaling.get("beta_slow") or 1
+    dim = 2 * inv_freq.numel()
+
+    def correction_dim(rotations):
+        return dim * math.log(old_context_len / (rotations * 2 * math.pi)) / (2 * math.log(base))
+
+    low, high = correction_dim(beta_fast), correction_dim(beta_slow)
+    if rope_scaling.get("truncate", True):
+        low, high = math.floor(low), math.ceil(high)
+    low, high = max(low, 0), min(high, dim - 1)
+    if low == high:
+        high += 0.001
+    ramp = ((torch.arange(dim // 2, dtype=torch.float32) - low) / (high - low)).clamp(0, 1)
+    extrapolation = 1 - ramp  # Share of each frequency left as trained.
+    inv_freq = inv_freq / factor * (1 - extrapolation) + inv_freq * extrapolation
+    attention_factor = 0.1 * math.log(factor) + 1.0 if factor > 1 else 1.0
+    return inv_freq, attention_factor
+
+
 def apply_rotary_emb(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -49,12 +78,18 @@ class RotaryEmbedding(nn.Module):
         self.head_size = head_size
         assert rotary_dim == head_size
         inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
-        if rope_scaling is not None and rope_scaling.get("rope_type") == "llama3":
+        attention_factor = 1.0
+        rope_type = (rope_scaling or {}).get("rope_type", "default")
+        if rope_type == "llama3":
             inv_freq = _llama3_inv_freq(inv_freq, rope_scaling)
+        elif rope_type == "yarn":
+            inv_freq, attention_factor = _yarn_inv_freq(inv_freq, rope_scaling, base)
+        elif rope_type != "default":
+            raise NotImplementedError(f"rope_type {rope_type!r}")
         t = torch.arange(max_position_embeddings, dtype=torch.float)
         freqs = torch.einsum("i,j -> ij", t, inv_freq)
-        cos = freqs.cos()
-        sin = freqs.sin()
+        cos = freqs.cos() * attention_factor
+        sin = freqs.sin() * attention_factor
         cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
