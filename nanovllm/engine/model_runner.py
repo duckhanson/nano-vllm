@@ -10,6 +10,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.models.llama import LlamaForCausalLM
+from nanovllm.models.phi3 import Phi3ForCausalLM
 from nanovllm.layers.attention import WORKSPACE_BYTES, plan_decode, plan_mixed_extend
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
@@ -20,6 +21,7 @@ from nanovllm.utils.mapped_kv_cache import allocate_mapped_kv_cache
 MODEL_REGISTRY = {
     "Qwen3ForCausalLM": Qwen3ForCausalLM,
     "LlamaForCausalLM": LlamaForCausalLM,
+    "Phi3ForCausalLM": Phi3ForCausalLM,
 }
 
 

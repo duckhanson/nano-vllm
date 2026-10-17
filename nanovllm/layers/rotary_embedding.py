@@ -53,6 +53,25 @@ def _yarn_inv_freq(inv_freq: torch.Tensor, rope_scaling: dict, base: float) -> t
     return inv_freq, attention_factor
 
 
+def _longrope_inv_freq(rotary_dim: int, base: float, rope_scaling: dict,
+                       max_position: int) -> tuple[torch.Tensor, float]:
+    """LongRoPE's long-factor frequencies and attention factor (Phi-4-mini).
+    Mirrors transformers.modeling_rope_utils._compute_longrope_parameters past
+    original_max_position_embeddings. Always the long factor: transformers
+    switches to it once a sequence passes that length, which a KV cache cannot
+    follow (keys already rotated stay short-factor), and every TideKV context
+    is past it (phi4_mini_generality SPEC)."""
+    for key in ("factor", "attention_factor"):
+        if rope_scaling.get(key) is not None:
+            raise NotImplementedError(f"LongRoPE {key} is not supported")
+    original = rope_scaling["original_max_position_embeddings"]
+    long_factor = torch.tensor(rope_scaling["long_factor"], dtype=torch.float32)
+    inv_freq = 1.0 / (long_factor * base**(torch.arange(0, rotary_dim, 2, dtype=torch.int64).float() / rotary_dim))
+    factor = max_position / original
+    attention_factor = math.sqrt(1 + math.log(factor) / math.log(original)) if factor > 1 else 1.0
+    return inv_freq, attention_factor
+
+
 def apply_rotary_emb(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -76,7 +95,7 @@ class RotaryEmbedding(nn.Module):
     ) -> None:
         super().__init__()
         self.head_size = head_size
-        assert rotary_dim == head_size
+        self.rotary_dim = rotary_dim  # Below head_size, the rest of each head passes through (Phi-4-mini).
         inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         attention_factor = 1.0
         rope_type = (rope_scaling or {}).get("rope_type", "default")
@@ -84,6 +103,8 @@ class RotaryEmbedding(nn.Module):
             inv_freq = _llama3_inv_freq(inv_freq, rope_scaling)
         elif rope_type == "yarn":
             inv_freq, attention_factor = _yarn_inv_freq(inv_freq, rope_scaling, base)
+        elif rope_type == "longrope":
+            inv_freq, attention_factor = _longrope_inv_freq(rotary_dim, base, rope_scaling, max_position_embeddings)
         elif rope_type != "default":
             raise NotImplementedError(f"rope_type {rope_type!r}")
         t = torch.arange(max_position_embeddings, dtype=torch.float)
@@ -102,9 +123,12 @@ class RotaryEmbedding(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cos_sin = self.cos_sin_cache[positions]
         cos, sin = cos_sin.chunk(2, dim=-1)
-        query = apply_rotary_emb(query, cos, sin)
-        key = apply_rotary_emb(key, cos, sin)
-        return query, key
+        return self._rotate(query, cos, sin), self._rotate(key, cos, sin)
+
+    def _rotate(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        if self.rotary_dim == self.head_size:
+            return apply_rotary_emb(x, cos, sin)
+        return torch.cat((apply_rotary_emb(x[..., :self.rotary_dim], cos, sin), x[..., self.rotary_dim:]), dim=-1)
 
 
 @lru_cache(1)
@@ -127,5 +151,7 @@ def get_rope(
     base: float,
     rope_scaling: dict | None = None,
 ):
-    rope_scaling_items = tuple(sorted(rope_scaling.items())) if rope_scaling is not None else None
+    # LongRoPE's factors are lists; tuples keep the key hashable.
+    rope_scaling_items = tuple(sorted((k, tuple(v) if isinstance(v, list) else v) for k, v in rope_scaling.items())) \
+        if rope_scaling is not None else None
     return _get_rope_cached(head_size, rotary_dim, max_position, base, rope_scaling_items)
